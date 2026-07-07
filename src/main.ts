@@ -20,6 +20,7 @@ let tray: Tray | null = null
 let isQuitting = false
 let builtinServerEnabled = false
 let builtinServerProcess: ChildProcess | null = null
+let connectorProcess: ChildProcess | null = null
 
 type BuiltinServerPhase = "idle" | "checking" | "downloading" | "starting" | "running" | "error"
 
@@ -50,6 +51,13 @@ interface BuiltinServerInstallMeta {
   tagName: string
   assetName: string
   executablePath: string
+}
+
+interface StartConnectorInput {
+  serverURL: string
+  token: string
+  mode: "platform" | "web_server"
+  webPort?: number
 }
 
 let builtinServerStatus: BuiltinServerStatus = {
@@ -119,10 +127,6 @@ function builtinServerConfigPath() {
   return path.join(veloceDataDir(), "desktop-server.json")
 }
 
-function builtinServerRoot() {
-  return path.join(veloceDataDir(), "community")
-}
-
 async function readBuiltinServerConfig() {
   try {
     const raw = await fsp.readFile(builtinServerConfigPath(), "utf8")
@@ -161,6 +165,7 @@ function setupBuiltinServerIPC() {
     }
     return builtinServerStatus
   })
+  ipcMain.handle("connector:start", async (_event, input: StartConnectorInput) => startConnector(input))
 }
 
 async function ensureBuiltinServerRunning() {
@@ -203,20 +208,47 @@ function stopBuiltinServer() {
 }
 
 async function ensureLatestCommunityInstall() {
-  const release = await requestJSON<GitHubRelease>("https://api.github.com/repos/WindyPear-Team/veloce/releases/latest")
-  const asset = selectCommunityAsset(release.assets)
+  return ensureLatestGitHubInstall({
+    repo: "WindyPear-Team/veloce",
+    rootName: "community",
+    preferredKeyword: "community",
+    onPhase: (phase, message, version) => updateBuiltinServerStatus({ phase, message, version }),
+  })
+}
+
+async function ensureLatestConnectorInstall() {
+  return ensureLatestGitHubInstall({
+    repo: "WindyPear-Team/veloce-app",
+    rootName: "connector",
+    preferredKeyword: "app",
+  })
+}
+
+async function ensureLatestGitHubInstall({
+  repo,
+  rootName,
+  preferredKeyword,
+  onPhase,
+}: {
+  repo: string
+  rootName: string
+  preferredKeyword: string
+  onPhase?: (phase: BuiltinServerPhase, message: string, version: string) => void
+}) {
+  const release = await requestJSON<GitHubRelease>(`https://api.github.com/repos/${repo}/releases/latest`)
+  const asset = selectReleaseAsset(release.assets, preferredKeyword)
   if (!asset) {
-    throw new Error("No compatible community release asset found")
+    throw new Error(`No compatible ${preferredKeyword} release asset found`)
   }
 
-  const root = builtinServerRoot()
+  const root = path.join(veloceDataDir(), rootName)
   const metaPath = path.join(root, "latest.json")
   const currentMeta = await readInstallMeta(metaPath)
   if (currentMeta?.tagName === release.tag_name && fs.existsSync(currentMeta.executablePath)) {
     return currentMeta
   }
 
-  updateBuiltinServerStatus({ phase: "downloading", message: `Downloading ${release.tag_name}`, version: release.tag_name })
+  onPhase?.("downloading", `Downloading ${release.tag_name}`, release.tag_name)
   const versionDir = path.join(root, safePathSegment(release.tag_name))
   const downloadDir = path.join(root, "downloads")
   await fsp.rm(versionDir, { recursive: true, force: true })
@@ -232,6 +264,43 @@ async function ensureLatestCommunityInstall() {
   return meta
 }
 
+async function startConnector(input: StartConnectorInput) {
+  const serverURL = input.serverURL.trim()
+  const token = input.token.trim()
+  if (!serverURL || !token) {
+    return { ok: false, message: "Missing connector server URL or token", version: "" }
+  }
+  try {
+    const install = await ensureLatestConnectorInstall()
+    stopConnector()
+    const args = ["-server", serverURL, "-token", token]
+    if (input.mode === "web_server") {
+      args.push("-mode", "web_server", "-web-port", String(input.webPort || 8080))
+    }
+    connectorProcess = spawn(install.executablePath, args, {
+      cwd: path.dirname(install.executablePath),
+      env: { ...process.env },
+      stdio: "ignore",
+      windowsHide: true,
+    })
+    connectorProcess.on("exit", () => {
+      connectorProcess = null
+    })
+    connectorProcess.unref()
+    return { ok: true, message: "Connector started", version: install.tagName }
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : "Failed to start connector", version: "" }
+  }
+}
+
+function stopConnector() {
+  if (!connectorProcess) {
+    return
+  }
+  connectorProcess.kill()
+  connectorProcess = null
+}
+
 async function readInstallMeta(metaPath: string) {
   try {
     const raw = await fsp.readFile(metaPath, "utf8")
@@ -241,10 +310,10 @@ async function readInstallMeta(metaPath: string) {
   }
 }
 
-function selectCommunityAsset(assets: GitHubReleaseAsset[]) {
+function selectReleaseAsset(assets: GitHubReleaseAsset[], preferredKeyword: string) {
   let best: { asset: GitHubReleaseAsset; score: number } | null = null
   for (const asset of assets) {
-    const score = scoreAsset(asset.name)
+    const score = scoreAsset(asset.name, preferredKeyword)
     if (score > (best?.score ?? -1)) {
       best = { asset, score }
     }
@@ -252,44 +321,67 @@ function selectCommunityAsset(assets: GitHubReleaseAsset[]) {
   return best && best.score > 0 ? best.asset : null
 }
 
-function scoreAsset(name: string) {
+function scoreAsset(name: string, preferredKeyword: string) {
   const normalized = name.toLowerCase()
   let score = 0
-  if (normalized.includes("desktop")) {
+  if (!/\.(zip|tar\.gz|tgz|exe)$/.test(normalized)) {
     return -1
   }
-  if (normalized.includes("community")) {
+  if (!assetRuntimeSuffixMatches(normalized)) {
+    return -1
+  }
+  if (preferredKeyword && normalized.includes(preferredKeyword.toLowerCase())) {
     score += 20
   }
   if (normalized.includes("veloce")) {
     score += 5
   }
   if (process.platform === "win32") {
-    if (!/(win|windows)/.test(normalized) && !normalized.endsWith(".exe")) {
-      return -1
-    }
     score += normalized.endsWith(".exe") ? 10 : 6
   } else if (process.platform === "linux") {
-    if (!/(linux|gnu)/.test(normalized)) {
-      return -1
-    }
     score += 8
   } else if (process.platform === "darwin") {
-    if (!/(darwin|mac|macos|osx)/.test(normalized)) {
-      return -1
-    }
     score += 8
   }
-  if (process.arch === "x64" && /(x64|amd64)/.test(normalized)) {
-    score += 8
-  }
-  if (process.arch === "arm64" && /(arm64|aarch64)/.test(normalized)) {
-    score += 8
-  }
-  if (/\.(zip|tar\.gz|tgz|exe)$/.test(normalized)) {
-    score += 4
-  }
+  score += 8
+  score += 4
   return score
+}
+
+function assetRuntimeSuffixMatches(normalizedName: string) {
+  const platform = releaseAssetPlatform()
+  const arch = releaseAssetArch()
+  if (!platform || !arch) {
+    return false
+  }
+  return releaseAssetExtensions().some((extension) => normalizedName.endsWith(`-${platform}-${arch}${extension}`))
+}
+
+function releaseAssetPlatform() {
+  if (process.platform === "win32") {
+    return "windows"
+  }
+  if (process.platform === "linux") {
+    return "linux"
+  }
+  if (process.platform === "darwin") {
+    return "darwin"
+  }
+  return ""
+}
+
+function releaseAssetArch() {
+  if (process.arch === "x64") {
+    return "amd64"
+  }
+  if (process.arch === "arm64") {
+    return "arm64"
+  }
+  return ""
+}
+
+function releaseAssetExtensions() {
+  return process.platform === "win32" ? [".zip", ".exe", ".tar.gz", ".tgz"] : [".tar.gz", ".tgz", ".zip"]
 }
 
 async function installDownloadedAsset(downloadPath: string, versionDir: string) {
@@ -537,6 +629,7 @@ if (gotSingleInstanceLock) {
 app.on("before-quit", () => {
   isQuitting = true
   stopBuiltinServer()
+  stopConnector()
 })
 
 app.on("window-all-closed", () => {
