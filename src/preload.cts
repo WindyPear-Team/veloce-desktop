@@ -39,10 +39,33 @@ interface DesktopProcessStatus {
   }>
 }
 
+interface DesktopSettings {
+  httpProxy: string
+  builtinServerPath: string
+  connectorPath: string
+  preparedUpdate?: {
+    tagName: string
+    assetName: string
+    filePath: string
+  } | null
+}
+
+interface DesktopUpdateResult {
+  state: "ready" | "not_available" | "error"
+  message: string
+  version: string
+  filePath?: string
+}
+
 contextBridge.exposeInMainWorld("veloceDesktop", {
   getBuiltinServerStatus: () => ipcRenderer.invoke("builtin-server:get-status") as Promise<BuiltinServerStatus>,
   getDesktopProcessStatus: () => ipcRenderer.invoke("desktop-processes:get-status") as Promise<DesktopProcessStatus>,
   terminateDesktopProcess: (id: string) => ipcRenderer.invoke("desktop-processes:terminate", id) as Promise<DesktopProcessStatus>,
+  getDesktopSettings: () => ipcRenderer.invoke("desktop-settings:get") as Promise<DesktopSettings>,
+  saveDesktopSettings: (settings: DesktopSettings) => ipcRenderer.invoke("desktop-settings:save", settings) as Promise<DesktopSettings>,
+  chooseDesktopFile: () => ipcRenderer.invoke("desktop-settings:choose-file") as Promise<string>,
+  checkDesktopUpdate: () => ipcRenderer.invoke("desktop-update:check") as Promise<DesktopUpdateResult>,
+  installPreparedDesktopUpdate: () => ipcRenderer.invoke("desktop-update:install-prepared") as Promise<{ ok: boolean; message: string }>,
   setBuiltinServerEnabled: (enabled: boolean) => ipcRenderer.invoke("builtin-server:set-enabled", enabled) as Promise<BuiltinServerStatus>,
   startConnector: (input: StartConnectorInput) => ipcRenderer.invoke("connector:start", input) as Promise<StartConnectorResult>,
   onBuiltinServerStatus: (callback: (status: BuiltinServerStatus) => void) => {

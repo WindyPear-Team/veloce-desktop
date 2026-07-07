@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, Tray, ipcMain, shell } from "electron"
+import { app, BrowserWindow, Menu, Tray, dialog, ipcMain, shell } from "electron"
 import { spawn, spawnSync } from "node:child_process"
 import type { ChildProcess } from "node:child_process"
 import fs from "node:fs"
@@ -13,7 +13,6 @@ const __dirname = path.dirname(__filename)
 const indexPath = path.join(__dirname, "web", "index.html")
 const iconPath = path.join(__dirname, "..", "assets", "logo.png")
 const preloadPath = path.join(__dirname, "preload.cjs")
-const builtinServerURL = "http://localhost:12789"
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
@@ -51,6 +50,26 @@ interface BuiltinServerInstallMeta {
   tagName: string
   assetName: string
   executablePath: string
+}
+
+interface PreparedDesktopUpdate {
+  tagName: string
+  assetName: string
+  filePath: string
+}
+
+interface DesktopSettings {
+  httpProxy: string
+  builtinServerPath: string
+  connectorPath: string
+  preparedUpdate?: PreparedDesktopUpdate | null
+}
+
+interface DesktopUpdateResult {
+  state: "ready" | "not_available" | "error"
+  message: string
+  version: string
+  filePath?: string
 }
 
 interface StartConnectorInput {
@@ -100,11 +119,18 @@ let builtinServerStatus: BuiltinServerStatus = {
   running: false,
   phase: "idle",
   message: "",
-  serverURL: builtinServerURL,
+  serverURL: builtinServerURL(),
   version: "",
 }
 
 const connectorProcesses = new Map<string, ManagedConnectorProcess>()
+
+let desktopSettings: DesktopSettings = {
+  httpProxy: "",
+  builtinServerPath: "",
+  connectorPath: "",
+  preparedUpdate: null,
+}
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
 
@@ -164,6 +190,10 @@ function builtinServerConfigPath() {
   return path.join(veloceDataDir(), "desktop-server.json")
 }
 
+function desktopSettingsPath() {
+  return path.join(veloceDataDir(), "desktop-settings.json")
+}
+
 async function readBuiltinServerConfig() {
   try {
     const raw = await fsp.readFile(builtinServerConfigPath(), "utf8")
@@ -176,6 +206,151 @@ async function readBuiltinServerConfig() {
 async function writeBuiltinServerConfig(config: BuiltinServerConfig) {
   await fsp.mkdir(veloceDataDir(), { recursive: true })
   await fsp.writeFile(builtinServerConfigPath(), JSON.stringify(config, null, 2))
+}
+
+async function readDesktopSettings() {
+  try {
+    const raw = await fsp.readFile(desktopSettingsPath(), "utf8")
+    return normalizeDesktopSettings(JSON.parse(raw))
+  } catch {
+    return normalizeDesktopSettings({})
+  }
+}
+
+async function writeDesktopSettings(settings: DesktopSettings) {
+  desktopSettings = normalizeDesktopSettings(settings)
+  applyDesktopProxySettings()
+  await fsp.mkdir(veloceDataDir(), { recursive: true })
+  await fsp.writeFile(desktopSettingsPath(), JSON.stringify(desktopSettings, null, 2))
+  return desktopSettings
+}
+
+function normalizeDesktopSettings(value: unknown): DesktopSettings {
+  const item = value && typeof value === "object" ? value as Record<string, unknown> : {}
+  const prepared = item.preparedUpdate && typeof item.preparedUpdate === "object"
+    ? item.preparedUpdate as Record<string, unknown>
+    : null
+  return {
+    httpProxy: typeof item.httpProxy === "string" ? item.httpProxy.trim() : "",
+    builtinServerPath: typeof item.builtinServerPath === "string" ? item.builtinServerPath.trim() : "",
+    connectorPath: typeof item.connectorPath === "string" ? item.connectorPath.trim() : "",
+    preparedUpdate: prepared && typeof prepared.tagName === "string" && typeof prepared.assetName === "string" && typeof prepared.filePath === "string"
+      ? { tagName: prepared.tagName, assetName: prepared.assetName, filePath: prepared.filePath }
+      : null,
+  }
+}
+
+function applyDesktopProxySettings() {
+  const proxy = desktopSettings.httpProxy.trim()
+  if (proxy) {
+    process.env.HTTP_PROXY = proxy
+    process.env.HTTPS_PROXY = proxy
+    process.env.http_proxy = proxy
+    process.env.https_proxy = proxy
+  } else {
+    delete process.env.HTTP_PROXY
+    delete process.env.HTTPS_PROXY
+    delete process.env.http_proxy
+    delete process.env.https_proxy
+  }
+}
+
+function desktopProcessEnv() {
+  const env = { ...process.env }
+  const proxy = desktopSettings.httpProxy.trim()
+  if (proxy) {
+    env.HTTP_PROXY = proxy
+    env.HTTPS_PROXY = proxy
+    env.http_proxy = proxy
+    env.https_proxy = proxy
+  }
+  return env
+}
+
+function builtinServerPort() {
+  return (process.env.VELOCE_BUILTIN_SERVER_PORT || process.env.PORT || "8080").trim()
+}
+
+function builtinServerURL() {
+  return `http://localhost:${builtinServerPort()}`
+}
+
+function builtinServerEnv() {
+  return {
+    ...desktopProcessEnv(),
+    PORT: builtinServerPort(),
+  }
+}
+
+async function resolveBuiltinServerURL(pid?: number) {
+  if (pid) {
+    const port = await waitForProcessListenPort(pid, 8000)
+    if (port) {
+      return `http://localhost:${port}`
+    }
+  }
+  return builtinServerURL()
+}
+
+async function waitForProcessListenPort(pid: number, timeoutMs: number) {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    const port = detectProcessListenPort(pid)
+    if (port) {
+      return port
+    }
+    await sleep(250)
+  }
+  return null
+}
+
+function detectProcessListenPort(pid: number) {
+  if (process.platform === "win32") {
+    return detectWindowsListenPort(pid)
+  }
+  return detectLsofListenPort(pid) || detectSsListenPort(pid)
+}
+
+function detectWindowsListenPort(pid: number) {
+  const script = `$ErrorActionPreference='SilentlyContinue'; ` + [
+    `Get-NetTCPConnection -OwningProcess ${pid} -State Listen`,
+    "Where-Object { $_.LocalAddress -eq '127.0.0.1' -or $_.LocalAddress -eq '0.0.0.0' -or $_.LocalAddress -eq '::1' -or $_.LocalAddress -eq '::' }",
+    "Sort-Object LocalPort",
+    "Select-Object -First 1 -ExpandProperty LocalPort",
+  ].join(" | ")
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-Command", script], { encoding: "utf8", windowsHide: true })
+  return firstPort(result.stdout)
+}
+
+function detectLsofListenPort(pid: number) {
+  const result = spawnSync("lsof", ["-nP", "-a", "-p", String(pid), "-iTCP", "-sTCP:LISTEN", "-FnP"], { encoding: "utf8" })
+  return firstPort(result.stdout)
+}
+
+function detectSsListenPort(pid: number) {
+  const result = spawnSync("ss", ["-ltnp"], { encoding: "utf8" })
+  const line = result.stdout
+    .split(/\r?\n/)
+    .find((item) => item.includes(`pid=${pid},`))
+  return firstPort(line || "")
+}
+
+function firstPort(value: string) {
+  const colonMatch = value.match(/:(\d+)(?:\s|$)/)
+  const plainMatch = value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => /^\d{2,5}$/.test(line))
+  const rawPort = colonMatch?.[1] || plainMatch
+  if (!rawPort) {
+    return null
+  }
+  const port = Number(rawPort)
+  return port > 0 && port <= 65535 ? port : null
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function updateBuiltinServerStatus(patch: Partial<BuiltinServerStatus>) {
@@ -264,20 +439,25 @@ function setupBuiltinServerIPC() {
   ipcMain.handle("connector:start", async (_event, input: StartConnectorInput) => startConnector(input))
   ipcMain.handle("desktop-processes:terminate", (_event, id: string) => terminateManagedProcess(id))
   ipcMain.handle("desktop-processes:get-status", () => getDesktopProcessStatus())
+  ipcMain.handle("desktop-settings:get", () => desktopSettings)
+  ipcMain.handle("desktop-settings:save", async (_event, input: DesktopSettings) => writeDesktopSettings(input))
+  ipcMain.handle("desktop-settings:choose-file", async () => chooseDesktopExecutable())
+  ipcMain.handle("desktop-update:check", async () => checkDesktopUpdate())
+  ipcMain.handle("desktop-update:install-prepared", async () => installPreparedDesktopUpdate())
 }
 
 async function ensureBuiltinServerRunning() {
   if (builtinServerProcess && !builtinServerProcess.killed) {
-    return updateBuiltinServerStatus({ phase: "running", message: "Built-in server is running", serverURL: builtinServerURL })
+    return updateBuiltinServerStatus({ phase: "running", message: "Built-in server is running", serverURL: builtinServerStatus.serverURL || builtinServerURL() })
   }
 
   try {
-    updateBuiltinServerStatus({ phase: "checking", message: "Checking latest community release", serverURL: builtinServerURL })
+    updateBuiltinServerStatus({ phase: "checking", message: "Checking latest community release", serverURL: "" })
     const install = await ensureLatestCommunityInstall()
     updateBuiltinServerStatus({ phase: "starting", message: "Starting built-in server", version: install.tagName })
     builtinServerProcess = spawn(install.executablePath, [], {
       cwd: path.dirname(install.executablePath),
-      env: { ...process.env },
+      env: builtinServerEnv(),
       stdio: "ignore",
       windowsHide: true,
     })
@@ -288,7 +468,8 @@ async function ensureBuiltinServerRunning() {
       }
     })
     builtinServerProcess.unref()
-    return updateBuiltinServerStatus({ phase: "running", message: "Built-in server is running", serverURL: builtinServerURL, version: install.tagName })
+    const serverURL = await resolveBuiltinServerURL(builtinServerProcess.pid)
+    return updateBuiltinServerStatus({ phase: "running", message: "Built-in server is running", serverURL, version: install.tagName })
   } catch (error) {
     return updateBuiltinServerStatus({
       phase: "error",
@@ -306,6 +487,15 @@ function stopBuiltinServer() {
 }
 
 async function ensureLatestCommunityInstall() {
+  const customPath = desktopSettings.builtinServerPath.trim()
+  if (customPath) {
+    await assertExecutableFile(customPath, "Built-in server")
+    return {
+      tagName: "custom",
+      assetName: path.basename(customPath),
+      executablePath: customPath,
+    }
+  }
   return ensureLatestGitHubInstall({
     repo: "WindyPear-Team/veloce",
     rootName: "community",
@@ -315,6 +505,15 @@ async function ensureLatestCommunityInstall() {
 }
 
 async function ensureLatestConnectorInstall(connectorID?: string) {
+  const customPath = desktopSettings.connectorPath.trim()
+  if (customPath) {
+    await assertExecutableFile(customPath, "Connector")
+    return {
+      tagName: "custom",
+      assetName: path.basename(customPath),
+      executablePath: customPath,
+    }
+  }
   return ensureLatestGitHubInstall({
     repo: "WindyPear-Team/veloce-app",
     rootName: "connector",
@@ -396,7 +595,7 @@ async function startConnector(input: StartConnectorInput) {
     }
     const childProcess = spawn(install.executablePath, args, {
       cwd: path.dirname(install.executablePath),
-      env: { ...process.env },
+      env: desktopProcessEnv(),
       stdio: "ignore",
       windowsHide: true,
     })
@@ -452,6 +651,91 @@ function stopAllConnectors() {
   emitDesktopProcessStatus()
 }
 
+async function assertExecutableFile(filePath: string, label: string) {
+  const stat = await fsp.stat(filePath).catch(() => null)
+  if (!stat?.isFile()) {
+    throw new Error(`${label} file does not exist`)
+  }
+}
+
+async function chooseDesktopExecutable() {
+  const options = {
+    title: "Select executable",
+    properties: ["openFile"] as Array<"openFile">,
+  }
+  const result = mainWindow
+    ? await dialog.showOpenDialog(mainWindow, options)
+    : await dialog.showOpenDialog(options)
+  return result.canceled ? "" : result.filePaths[0] || ""
+}
+
+async function checkDesktopUpdate(): Promise<DesktopUpdateResult> {
+  const prepared = desktopSettings.preparedUpdate
+  if (prepared && fs.existsSync(prepared.filePath)) {
+    return {
+      state: "ready",
+      message: "Update is ready",
+      version: prepared.tagName,
+      filePath: prepared.filePath,
+    }
+  }
+
+  try {
+    const release = await requestJSON<GitHubRelease>("https://api.github.com/repos/WindyPear-Team/veloce-desktop/releases/latest")
+    const asset = selectDesktopUpdateAsset(release.assets)
+    if (!asset) {
+      return { state: "not_available", message: "No compatible desktop update asset found", version: release.tag_name }
+    }
+
+    const root = path.join(veloceDataDir(), "desktop-updates", safePathSegment(release.tag_name))
+    await fsp.mkdir(root, { recursive: true })
+    const downloadPath = path.join(root, asset.name)
+    if (!fs.existsSync(downloadPath)) {
+      await downloadFile(asset.browser_download_url, downloadPath)
+    }
+    await writeDesktopSettings({
+      ...desktopSettings,
+      preparedUpdate: {
+        tagName: release.tag_name,
+        assetName: asset.name,
+        filePath: downloadPath,
+      },
+    })
+    return {
+      state: "ready",
+      message: "Update is ready",
+      version: release.tag_name,
+      filePath: downloadPath,
+    }
+  } catch (error) {
+    return {
+      state: "error",
+      message: error instanceof Error ? error.message : "Failed to check updates",
+      version: "",
+    }
+  }
+}
+
+async function installPreparedDesktopUpdate() {
+  const prepared = desktopSettings.preparedUpdate
+  if (!prepared || !fs.existsSync(prepared.filePath)) {
+    return { ok: false, message: "No prepared update installer" }
+  }
+  isQuitting = true
+  if (process.platform === "win32" && prepared.filePath.toLowerCase().endsWith(".exe")) {
+    spawn(prepared.filePath, [], {
+      cwd: path.dirname(prepared.filePath),
+      detached: true,
+      stdio: "ignore",
+      windowsHide: false,
+    }).unref()
+  } else {
+    await shell.openPath(prepared.filePath)
+  }
+  app.quit()
+  return { ok: true, message: "Installer started" }
+}
+
 async function readInstallMeta(metaPath: string) {
   try {
     const raw = await fsp.readFile(metaPath, "utf8")
@@ -470,6 +754,34 @@ function selectReleaseAsset(assets: GitHubReleaseAsset[], preferredKeyword: stri
     }
   }
   return best && best.score > 0 ? best.asset : null
+}
+
+function selectDesktopUpdateAsset(assets: GitHubReleaseAsset[]) {
+  const suffixes = desktopUpdateSuffixes()
+  return assets.find((asset) => {
+    const normalized = asset.name.toLowerCase()
+    if (normalized.endsWith(".blockmap") || normalized.endsWith(".yml") || normalized.endsWith(".yaml")) {
+      return false
+    }
+    return suffixes.some((suffix) => normalized.endsWith(suffix))
+  }) || null
+}
+
+function desktopUpdateSuffixes() {
+  const arch = process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "x64" : ""
+  if (!arch) {
+    return []
+  }
+  if (process.platform === "win32") {
+    return [`-win-${arch}.exe`]
+  }
+  if (process.platform === "darwin") {
+    return [`-mac-${arch}.dmg`]
+  }
+  if (process.platform === "linux") {
+    return [`-linux-${arch}.appimage`, `-linux-${arch}.deb`]
+  }
+  return []
 }
 
 function scoreAsset(name: string, preferredKeyword: string) {
@@ -765,6 +1077,8 @@ if (gotSingleInstanceLock) {
   setupBuiltinServerIPC()
 
   app.whenReady().then(async () => {
+    desktopSettings = await readDesktopSettings()
+    applyDesktopProxySettings()
     const config = await readBuiltinServerConfig()
     builtinServerEnabled = Boolean(config.enabled)
     updateBuiltinServerStatus({ enabled: builtinServerEnabled })

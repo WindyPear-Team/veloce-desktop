@@ -34,12 +34,14 @@
       "target": [
         "dmg"
       ],
+      "icon": "assets/icon.icns",
       "category": "public.app-category.productivity"
     },
     "win": {
       "target": [
         "nsis"
-      ]
+      ],
+      "icon": "assets/icon.ico"
     },
     "linux": {
       "target": [

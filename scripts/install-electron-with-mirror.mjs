@@ -13,6 +13,7 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const electronRoot = path.resolve(__dirname, "..", "node_modules", "electron")
 const distPath = path.join(electronRoot, "dist")
+const nextDistPath = path.join(electronRoot, `dist-next-${process.pid}`)
 const platform = process.env.npm_config_platform || process.platform
 const arch = process.env.npm_config_arch || process.arch
 
@@ -28,9 +29,11 @@ const zipPath = await downloadArtifact({
   arch,
 })
 
+await fs.rm(nextDistPath, { recursive: true, force: true })
+await fs.mkdir(nextDistPath, { recursive: true })
+extractArchive(zipPath, nextDistPath)
 await fs.rm(distPath, { recursive: true, force: true })
-await fs.mkdir(distPath, { recursive: true })
-extractArchive(zipPath, distPath)
+await fs.rename(nextDistPath, distPath)
 await fs.writeFile(path.join(electronRoot, "path.txt"), platformPath(platform))
 
 function extractArchive(zipPath, destination) {
