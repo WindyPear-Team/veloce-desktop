@@ -1,0 +1,98 @@
+name: Release Desktop
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  WEB_REPOSITORY: WindyPear-Team/veloce-web
+  ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
+  ELECTRON_BUILDER_BINARIES_MIRROR: https://npmmirror.com/mirrors/electron-builder-binaries/
+
+jobs:
+  build:
+    name: ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-latest
+            arch: x64
+          - os: linux
+            runner: ubuntu-latest
+            arch: arm64
+          - os: windows
+            runner: windows-latest
+            arch: x64
+          - os: windows
+            runner: windows-latest
+            arch: arm64
+          - os: mac
+            runner: macos-latest
+            arch: x64
+          - os: mac
+            runner: macos-latest
+            arch: arm64
+
+    steps:
+      - name: Checkout desktop
+        uses: actions/checkout@v4
+        with:
+          path: desktop
+          fetch-depth: 0
+
+      - name: Checkout shared web
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.WEB_REPOSITORY }}
+          ref: ${{ github.ref_name }}
+          path: web
+          token: ${{ secrets.CHECKOUT_TOKEN || github.token }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Set package version
+        working-directory: desktop
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          npm version "$version" --no-git-tag-version
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: |
+          npm ci
+          npm run install:electron
+
+      - name: Install web dependencies
+        working-directory: web
+        run: |
+          corepack enable
+          corepack yarn install --immutable
+
+      - name: Build desktop app
+        working-directory: desktop
+        run: npm run build
+
+      - name: Build installer
+        working-directory: desktop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --${{ matrix.os }} --${{ matrix.arch }} --publish never
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: desktop/release/*
