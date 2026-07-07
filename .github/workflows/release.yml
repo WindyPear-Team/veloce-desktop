@@ -11,8 +11,6 @@ permissions:
 
 env:
   WEB_REPOSITORY: WindyPear-Team/veloce-web
-  ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
-  ELECTRON_BUILDER_BINARIES_MIRROR: https://npmmirror.com/mirrors/electron-builder-binaries/
 
 jobs:
   build:
@@ -72,9 +70,7 @@ jobs:
 
       - name: Install desktop dependencies
         working-directory: desktop
-        run: |
-          npm ci
-          npm run install:electron
+        run: npm ci
 
       - name: Install web dependencies
         working-directory: web

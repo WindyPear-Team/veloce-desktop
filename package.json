@@ -3,7 +3,10 @@
   "private": true,
   "version": "0.1.0",
   "description": "Veloce Desktop Beta",
-  "author": "WindyPear Team",
+  "author": {
+    "name": "WindyPear Team",
+    "email": "fireguo@flweb.cn"
+  },
   "type": "module",
   "main": "dist/main.js",
   "scripts": {
@@ -44,7 +47,8 @@
         "deb"
       ],
       "category": "Utility",
-      "icon": "assets/logo.png"
+      "icon": "assets/logo.png",
+      "maintainer": "WindyPear Team <fireguo@flweb.cn>"
     },
     "nsis": {
       "oneClick": false,
