@@ -22,13 +22,37 @@ interface StartConnectorResult {
   version: string
 }
 
+interface DesktopProcessStatus {
+  generatedAt: string
+  processes: Array<{
+    id: string
+    kind: "builtin-server" | "connector"
+    running: boolean
+    phase: "idle" | "checking" | "downloading" | "starting" | "running" | "error"
+    message: string
+    pid: number | null
+    version: string
+    serverURL?: string
+    mode?: string
+    enabled?: boolean
+    startedAt?: string
+  }>
+}
+
 contextBridge.exposeInMainWorld("veloceDesktop", {
   getBuiltinServerStatus: () => ipcRenderer.invoke("builtin-server:get-status") as Promise<BuiltinServerStatus>,
+  getDesktopProcessStatus: () => ipcRenderer.invoke("desktop-processes:get-status") as Promise<DesktopProcessStatus>,
+  terminateDesktopProcess: (id: string) => ipcRenderer.invoke("desktop-processes:terminate", id) as Promise<DesktopProcessStatus>,
   setBuiltinServerEnabled: (enabled: boolean) => ipcRenderer.invoke("builtin-server:set-enabled", enabled) as Promise<BuiltinServerStatus>,
   startConnector: (input: StartConnectorInput) => ipcRenderer.invoke("connector:start", input) as Promise<StartConnectorResult>,
   onBuiltinServerStatus: (callback: (status: BuiltinServerStatus) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, status: BuiltinServerStatus) => callback(status)
     ipcRenderer.on("builtin-server:status", listener)
     return () => ipcRenderer.off("builtin-server:status", listener)
+  },
+  onDesktopProcessStatus: (callback: (status: DesktopProcessStatus) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, status: DesktopProcessStatus) => callback(status)
+    ipcRenderer.on("desktop-processes:status", listener)
+    return () => ipcRenderer.off("desktop-processes:status", listener)
   },
 })

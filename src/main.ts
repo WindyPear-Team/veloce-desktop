@@ -20,9 +20,9 @@ let tray: Tray | null = null
 let isQuitting = false
 let builtinServerEnabled = false
 let builtinServerProcess: ChildProcess | null = null
-let connectorProcess: ChildProcess | null = null
 
 type BuiltinServerPhase = "idle" | "checking" | "downloading" | "starting" | "running" | "error"
+type ManagedProcessKind = "builtin-server" | "connector"
 
 interface BuiltinServerStatus {
   enabled: boolean
@@ -60,6 +60,41 @@ interface StartConnectorInput {
   webPort?: number
 }
 
+interface ConnectorStatus {
+  id: string
+  running: boolean
+  phase: BuiltinServerPhase
+  message: string
+  serverURL: string
+  version: string
+  mode: "platform" | "web_server"
+  startedAt: string
+}
+
+interface ManagedProcessStatus {
+  id: string
+  kind: ManagedProcessKind
+  running: boolean
+  phase: BuiltinServerPhase
+  message: string
+  pid: number | null
+  version: string
+  serverURL?: string
+  mode?: string
+  enabled?: boolean
+  startedAt?: string
+}
+
+interface DesktopProcessStatus {
+  generatedAt: string
+  processes: ManagedProcessStatus[]
+}
+
+interface ManagedConnectorProcess {
+  process: ChildProcess | null
+  status: ConnectorStatus
+}
+
 let builtinServerStatus: BuiltinServerStatus = {
   enabled: false,
   running: false,
@@ -68,6 +103,8 @@ let builtinServerStatus: BuiltinServerStatus = {
   serverURL: builtinServerURL,
   version: "",
 }
+
+const connectorProcesses = new Map<string, ManagedConnectorProcess>()
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
 
@@ -149,7 +186,66 @@ function updateBuiltinServerStatus(patch: Partial<BuiltinServerStatus>) {
     running: Boolean(builtinServerProcess && !builtinServerProcess.killed),
   }
   mainWindow?.webContents.send("builtin-server:status", builtinServerStatus)
+  emitDesktopProcessStatus()
   return builtinServerStatus
+}
+
+function updateConnectorStatus(id: string, patch: Partial<ConnectorStatus>) {
+  const connector = connectorProcesses.get(id)
+  if (!connector) {
+    return null
+  }
+  connector.status = {
+    ...connector.status,
+    ...patch,
+    running: Boolean(connector.process && !connector.process.killed),
+  }
+  emitDesktopProcessStatus()
+  return connector.status
+}
+
+function getDesktopProcessStatus(): DesktopProcessStatus {
+  const builtinRunning = Boolean(builtinServerProcess && !builtinServerProcess.killed)
+  const processes: ManagedProcessStatus[] = []
+  if (builtinRunning) {
+    processes.push({
+      id: "builtin-server",
+      kind: "builtin-server",
+      running: true,
+      phase: builtinServerStatus.phase,
+      message: builtinServerStatus.message,
+      pid: builtinServerProcess?.pid ?? null,
+      version: builtinServerStatus.version,
+      serverURL: builtinServerStatus.serverURL,
+      enabled: builtinServerStatus.enabled,
+    })
+  }
+  for (const connector of connectorProcesses.values()) {
+    const connectorRunning = Boolean(connector.process && !connector.process.killed)
+    if (!connectorRunning) {
+      continue
+    }
+    processes.push({
+      id: connector.status.id,
+      kind: "connector",
+      running: true,
+      phase: connector.status.phase,
+      message: connector.status.message,
+      pid: connector.process?.pid ?? null,
+      version: connector.status.version,
+      serverURL: connector.status.serverURL,
+      mode: connector.status.mode,
+      startedAt: connector.status.startedAt,
+    })
+  }
+  return {
+    generatedAt: new Date().toISOString(),
+    processes,
+  }
+}
+
+function emitDesktopProcessStatus() {
+  mainWindow?.webContents.send("desktop-processes:status", getDesktopProcessStatus())
 }
 
 function setupBuiltinServerIPC() {
@@ -166,6 +262,8 @@ function setupBuiltinServerIPC() {
     return builtinServerStatus
   })
   ipcMain.handle("connector:start", async (_event, input: StartConnectorInput) => startConnector(input))
+  ipcMain.handle("desktop-processes:terminate", (_event, id: string) => terminateManagedProcess(id))
+  ipcMain.handle("desktop-processes:get-status", () => getDesktopProcessStatus())
 }
 
 async function ensureBuiltinServerRunning() {
@@ -216,11 +314,14 @@ async function ensureLatestCommunityInstall() {
   })
 }
 
-async function ensureLatestConnectorInstall() {
+async function ensureLatestConnectorInstall(connectorID?: string) {
   return ensureLatestGitHubInstall({
     repo: "WindyPear-Team/veloce-app",
     rootName: "connector",
     preferredKeyword: "app",
+    onPhase: connectorID
+      ? (phase, message, version) => updateConnectorStatus(connectorID, { phase, message, version })
+      : undefined,
   })
 }
 
@@ -270,35 +371,85 @@ async function startConnector(input: StartConnectorInput) {
   if (!serverURL || !token) {
     return { ok: false, message: "Missing connector server URL or token", version: "" }
   }
+  const connectorID = `connector-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  connectorProcesses.set(connectorID, {
+    process: null,
+    status: {
+      id: connectorID,
+      running: false,
+      phase: "checking",
+      message: "Checking latest connector release",
+      serverURL,
+      version: "",
+      mode: input.mode,
+      startedAt: "",
+    },
+  })
+  emitDesktopProcessStatus()
   try {
-    const install = await ensureLatestConnectorInstall()
-    stopConnector()
+    updateConnectorStatus(connectorID, { phase: "checking", message: "Checking latest connector release", serverURL, mode: input.mode })
+    const install = await ensureLatestConnectorInstall(connectorID)
+    updateConnectorStatus(connectorID, { phase: "starting", message: "Starting connector", serverURL, version: install.tagName, mode: input.mode })
     const args = ["-server", serverURL, "-token", token]
     if (input.mode === "web_server") {
       args.push("-mode", "web_server", "-web-port", String(input.webPort || 8080))
     }
-    connectorProcess = spawn(install.executablePath, args, {
+    const childProcess = spawn(install.executablePath, args, {
       cwd: path.dirname(install.executablePath),
       env: { ...process.env },
       stdio: "ignore",
       windowsHide: true,
     })
-    connectorProcess.on("exit", () => {
-      connectorProcess = null
+    const connector = connectorProcesses.get(connectorID)
+    if (connector) {
+      connector.process = childProcess
+    }
+    childProcess.on("exit", () => {
+      connectorProcesses.delete(connectorID)
+      emitDesktopProcessStatus()
     })
-    connectorProcess.unref()
+    childProcess.unref()
+    updateConnectorStatus(connectorID, {
+      phase: "running",
+      message: "Connector is running",
+      serverURL,
+      version: install.tagName,
+      mode: input.mode,
+      startedAt: new Date().toISOString(),
+    })
     return { ok: true, message: "Connector started", version: install.tagName }
   } catch (error) {
+    connectorProcesses.delete(connectorID)
+    emitDesktopProcessStatus()
     return { ok: false, message: error instanceof Error ? error.message : "Failed to start connector", version: "" }
   }
 }
 
-function stopConnector() {
-  if (!connectorProcess) {
-    return
+function terminateManagedProcess(id: string) {
+  if (id === "builtin-server") {
+    builtinServerEnabled = false
+    void writeBuiltinServerConfig({ enabled: false })
+    stopBuiltinServer()
+    updateBuiltinServerStatus({ phase: "idle", message: "", version: "" })
+    return getDesktopProcessStatus()
   }
-  connectorProcess.kill()
-  connectorProcess = null
+
+  const connector = connectorProcesses.get(id)
+  if (!connector) {
+    return getDesktopProcessStatus()
+  }
+  connector.process?.kill()
+  connectorProcesses.delete(id)
+  emitDesktopProcessStatus()
+  return getDesktopProcessStatus()
+}
+
+function stopAllConnectors() {
+  for (const connector of connectorProcesses.values()) {
+    connector.process?.kill()
+  }
+  connectorProcesses.clear()
+  emitDesktopProcessStatus()
 }
 
 async function readInstallMeta(metaPath: string) {
@@ -629,7 +780,7 @@ if (gotSingleInstanceLock) {
 app.on("before-quit", () => {
   isQuitting = true
   stopBuiltinServer()
-  stopConnector()
+  stopAllConnectors()
 })
 
 app.on("window-all-closed", () => {
