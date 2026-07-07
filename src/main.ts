@@ -194,6 +194,18 @@ function desktopSettingsPath() {
   return path.join(veloceDataDir(), "desktop-settings.json")
 }
 
+function builtinServerRuntimeDir() {
+  return path.join(veloceDataDir(), "community-data")
+}
+
+function builtinServerDBPath() {
+  const configured = process.env.VELOCE_BUILTIN_SERVER_DB_PATH?.trim()
+  if (configured) {
+    return path.isAbsolute(configured) ? configured : path.join(builtinServerRuntimeDir(), configured)
+  }
+  return path.join(builtinServerRuntimeDir(), "flai.db")
+}
+
 async function readBuiltinServerConfig() {
   try {
     const raw = await fsp.readFile(builtinServerConfigPath(), "utf8")
@@ -279,6 +291,7 @@ function builtinServerEnv() {
   return {
     ...desktopProcessEnv(),
     PORT: builtinServerPort(),
+    DB_PATH: builtinServerDBPath(),
   }
 }
 
@@ -454,9 +467,10 @@ async function ensureBuiltinServerRunning() {
   try {
     updateBuiltinServerStatus({ phase: "checking", message: "Checking latest community release", serverURL: "" })
     const install = await ensureLatestCommunityInstall()
+    await prepareBuiltinServerRuntime()
     updateBuiltinServerStatus({ phase: "starting", message: "Starting built-in server", version: install.tagName })
     builtinServerProcess = spawn(install.executablePath, [], {
-      cwd: path.dirname(install.executablePath),
+      cwd: builtinServerRuntimeDir(),
       env: builtinServerEnv(),
       stdio: "ignore",
       windowsHide: true,
@@ -484,6 +498,46 @@ function stopBuiltinServer() {
   }
   builtinServerProcess.kill()
   builtinServerProcess = null
+}
+
+async function prepareBuiltinServerRuntime() {
+  const runtimeDir = builtinServerRuntimeDir()
+  const dbPath = builtinServerDBPath()
+  await fsp.mkdir(runtimeDir, { recursive: true })
+  if (fs.existsSync(dbPath)) {
+    return
+  }
+  const legacyDBPath = await findLegacyBuiltinServerDB()
+  if (legacyDBPath) {
+    await fsp.mkdir(path.dirname(dbPath), { recursive: true })
+    await fsp.copyFile(legacyDBPath, dbPath)
+  }
+}
+
+async function findLegacyBuiltinServerDB() {
+  const communityRoot = path.join(veloceDataDir(), "community")
+  const candidates: Array<{ filePath: string; mtimeMs: number }> = []
+  await collectLegacyDBFiles(communityRoot, candidates)
+  candidates.sort((left, right) => right.mtimeMs - left.mtimeMs)
+  return candidates[0]?.filePath || null
+}
+
+async function collectLegacyDBFiles(root: string, candidates: Array<{ filePath: string; mtimeMs: number }>) {
+  const entries = await fsp.readdir(root, { withFileTypes: true }).catch(() => [])
+  for (const entry of entries) {
+    const fullPath = path.join(root, entry.name)
+    if (entry.isDirectory()) {
+      await collectLegacyDBFiles(fullPath, candidates)
+      continue
+    }
+    if (entry.name.toLowerCase() !== "flai.db") {
+      continue
+    }
+    const stat = await fsp.stat(fullPath).catch(() => null)
+    if (stat?.isFile()) {
+      candidates.push({ filePath: fullPath, mtimeMs: stat.mtimeMs })
+    }
+  }
 }
 
 async function ensureLatestCommunityInstall() {
