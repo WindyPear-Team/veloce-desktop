@@ -95,6 +95,12 @@ function createWindow() {
     minHeight: 640,
     title: "Veloce",
     icon: iconPath,
+    titleBarStyle: "hidden",
+    titleBarOverlay: {
+      color: "#ffffff00",
+      symbolColor: "#111827",
+      height: 36,
+    },
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
