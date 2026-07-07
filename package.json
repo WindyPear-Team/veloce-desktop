@@ -1,0 +1,14 @@
+{
+  "name": "veloce-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "main.js",
+  "scripts": {
+    "build:web": "npm --prefix ../web run build:desktop",
+    "start": "npm run build:web && electron ."
+  },
+  "devDependencies": {
+    "electron": "^38.0.0"
+  }
+}
