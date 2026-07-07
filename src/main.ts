@@ -1,14 +1,17 @@
-import { app, BrowserWindow, shell } from "electron"
+import { app, BrowserWindow, Menu, Tray, shell } from "electron"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
-const indexPath = path.join(__dirname, "dist", "web", "index.html")
+const indexPath = path.join(__dirname, "web", "index.html")
+const iconPath = path.join(__dirname, "..", "assets", "logo.png")
 
-let mainWindow = null
+let mainWindow: BrowserWindow | null = null
+let tray: Tray | null = null
+let isQuitting = false
 
-function tokenFromURL(rawURL) {
+function tokenFromURL(rawURL: string) {
   try {
     const url = new URL(rawURL)
     const queryToken = url.searchParams.get("token")
@@ -35,7 +38,19 @@ function loadLocalApp(hash = "/login") {
   void mainWindow.loadFile(indexPath, { hash })
 }
 
-function handleNavigationURL(event, rawURL) {
+function showMainWindow() {
+  if (!mainWindow) {
+    createWindow()
+    return
+  }
+  if (mainWindow.isMinimized()) {
+    mainWindow.restore()
+  }
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+function handleNavigationURL(event: Electron.Event, rawURL: string) {
   const token = tokenFromURL(rawURL)
   if (token) {
     event.preventDefault()
@@ -44,16 +59,32 @@ function handleNavigationURL(event, rawURL) {
   }
 
   const parsedURL = new URL(rawURL)
-  if (parsedURL.protocol === "file:") {
-    return
-  }
-
-  if (parsedURL.protocol === "http:" || parsedURL.protocol === "https:") {
+  if (parsedURL.protocol === "file:" || parsedURL.protocol === "http:" || parsedURL.protocol === "https:") {
     return
   }
 
   event.preventDefault()
   void shell.openExternal(rawURL)
+}
+
+function createTray() {
+  if (tray) {
+    return
+  }
+  tray = new Tray(iconPath)
+  tray.setToolTip("Veloce")
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: "显示 Veloce", click: showMainWindow },
+    { type: "separator" },
+    {
+      label: "退出",
+      click: () => {
+        isQuitting = true
+        app.quit()
+      },
+    },
+  ]))
+  tray.on("click", showMainWindow)
 }
 
 function createWindow() {
@@ -63,6 +94,7 @@ function createWindow() {
     minWidth: 960,
     minHeight: 640,
     title: "Veloce",
+    icon: iconPath,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -81,17 +113,28 @@ function createWindow() {
     }
     return { action: "deny" }
   })
+  mainWindow.on("close", (event) => {
+    if (isQuitting) {
+      return
+    }
+    event.preventDefault()
+    mainWindow?.hide()
+  })
+  mainWindow.on("closed", () => {
+    mainWindow = null
+  })
 
   loadLocalApp()
 }
 
 app.whenReady().then(() => {
+  createTray()
   createWindow()
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow()
-    }
-  })
+  app.on("activate", showMainWindow)
+})
+
+app.on("before-quit", () => {
+  isQuitting = true
 })
 
 app.on("window-all-closed", () => {

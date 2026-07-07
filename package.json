@@ -3,12 +3,19 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "main": "main.js",
+  "main": "dist/main.js",
   "scripts": {
+    "install:mirror": "node scripts/install-with-mirror.mjs",
+    "install:electron": "node scripts/install-electron-with-mirror.mjs",
     "build:web": "npm --prefix ../web run build:desktop",
-    "start": "npm run build:web && electron ."
+    "build:electron": "tsc -p tsconfig.json",
+    "build": "npm run build:web && npm run build:electron",
+    "start": "npm run build && electron ."
   },
   "devDependencies": {
-    "electron": "^38.0.0"
-  }
+    "@types/node": "^25.9.1",
+    "electron": "^38.0.0",
+    "typescript": "~6.0.2"
+  },
+  "allowScripts": {}
 }
