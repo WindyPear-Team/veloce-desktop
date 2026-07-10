@@ -24,3 +24,7 @@ npm run build:web
 ```
 
 Server selection is stored in local storage under `veloce.desktop.server_url`; the default is `http://localhost:12789`.
+
+## Special thanks
+
+[Linuxdo](https://linux.do)
