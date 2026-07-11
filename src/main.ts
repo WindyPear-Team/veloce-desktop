@@ -6,7 +6,7 @@ import fsp from "node:fs/promises"
 import https from "node:https"
 import os from "node:os"
 import path from "node:path"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -455,8 +455,23 @@ function setupBuiltinServerIPC() {
   ipcMain.handle("desktop-settings:get", () => desktopSettings)
   ipcMain.handle("desktop-settings:save", async (_event, input: DesktopSettings) => writeDesktopSettings(input))
   ipcMain.handle("desktop-settings:choose-file", async () => chooseDesktopExecutable())
+  ipcMain.handle("desktop:get-system-info", () => ({ hostname: os.hostname(), platform: process.platform }))
+  ipcMain.handle("desktop:open-in-vscode", async (_event, workspacePath: string) => openWorkspaceInVSCode(workspacePath))
   ipcMain.handle("desktop-update:check", async () => checkDesktopUpdate())
   ipcMain.handle("desktop-update:install-prepared", async () => installPreparedDesktopUpdate())
+}
+
+async function openWorkspaceInVSCode(workspacePath: string) {
+  const targetPath = workspacePath.trim()
+  if (!targetPath || !path.isAbsolute(targetPath)) {
+    return { ok: false, message: "A local absolute workspace path is required" }
+  }
+  try {
+    await shell.openExternal(`vscode://file${pathToFileURL(targetPath).pathname}`)
+    return { ok: true, message: "VS Code opened" }
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : "Failed to open VS Code" }
+  }
 }
 
 async function ensureBuiltinServerRunning() {
