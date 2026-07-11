@@ -46,12 +46,6 @@ interface BuiltinServerConfig {
   enabled?: boolean
 }
 
-interface BuiltinServerInstallMeta {
-  tagName: string
-  assetName: string
-  executablePath: string
-}
-
 interface PreparedDesktopUpdate {
   tagName: string
   assetName: string
@@ -480,7 +474,7 @@ async function ensureBuiltinServerRunning() {
   }
 
   try {
-    updateBuiltinServerStatus({ phase: "checking", message: "Checking latest community release", serverURL: "" })
+    updateBuiltinServerStatus({ phase: "checking", message: "Preparing bundled built-in server", serverURL: "" })
     const install = await ensureLatestCommunityInstall()
     await prepareBuiltinServerRuntime()
     updateBuiltinServerStatus({ phase: "starting", message: "Starting built-in server", version: install.tagName })
@@ -565,15 +559,10 @@ async function ensureLatestCommunityInstall() {
       executablePath: customPath,
     }
   }
-  return ensureLatestGitHubInstall({
-    repo: "WindyPear-Team/veloce",
-    rootName: "community",
-    preferredKeyword: "community",
-    onPhase: (phase, message, version) => updateBuiltinServerStatus({ phase, message, version }),
-  })
+  return bundledRuntimeInstall("flai-community", "Built-in server")
 }
 
-async function ensureLatestConnectorInstall(connectorID?: string) {
+async function ensureLatestConnectorInstall() {
   const customPath = desktopSettings.connectorPath.trim()
   if (customPath) {
     await assertExecutableFile(customPath, "Connector")
@@ -583,54 +572,22 @@ async function ensureLatestConnectorInstall(connectorID?: string) {
       executablePath: customPath,
     }
   }
-  return ensureLatestGitHubInstall({
-    repo: "WindyPear-Team/veloce-app",
-    rootName: "connector",
-    preferredKeyword: "app",
-    onPhase: connectorID
-      ? (phase, message, version) => updateConnectorStatus(connectorID, { phase, message, version })
-      : undefined,
-  })
+  return bundledRuntimeInstall("veloce-connector", "Connector")
 }
 
-async function ensureLatestGitHubInstall({
-  repo,
-  rootName,
-  preferredKeyword,
-  onPhase,
-}: {
-  repo: string
-  rootName: string
-  preferredKeyword: string
-  onPhase?: (phase: BuiltinServerPhase, message: string, version: string) => void
-}) {
-  const release = await requestJSON<GitHubRelease>(`https://api.github.com/repos/${repo}/releases/latest`)
-  const asset = selectReleaseAsset(release.assets, preferredKeyword)
-  if (!asset) {
-    throw new Error(`No compatible ${preferredKeyword} release asset found`)
+async function bundledRuntimeInstall(binaryName: string, label: string) {
+  const executableName = process.platform === "win32" ? `${binaryName}.exe` : binaryName
+  const resourceRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, "..", "resources")
+  const executablePath = path.join(resourceRoot, "bin", executableName)
+  await assertExecutableFile(executablePath, label)
+  if (process.platform !== "win32") {
+    await fsp.chmod(executablePath, 0o755)
   }
-
-  const root = path.join(veloceDataDir(), rootName)
-  const metaPath = path.join(root, "latest.json")
-  const currentMeta = await readInstallMeta(metaPath)
-  if (currentMeta?.tagName === release.tag_name && fs.existsSync(currentMeta.executablePath)) {
-    return currentMeta
+  return {
+    tagName: app.getVersion(),
+    assetName: executableName,
+    executablePath,
   }
-
-  onPhase?.("downloading", `Downloading ${release.tag_name}`, release.tag_name)
-  const versionDir = path.join(root, safePathSegment(release.tag_name))
-  const downloadDir = path.join(root, "downloads")
-  await fsp.rm(versionDir, { recursive: true, force: true })
-  await fsp.mkdir(versionDir, { recursive: true })
-  await fsp.mkdir(downloadDir, { recursive: true })
-
-  const downloadPath = path.join(downloadDir, asset.name)
-  await downloadFile(asset.browser_download_url, downloadPath)
-  const executablePath = await installDownloadedAsset(downloadPath, versionDir)
-  const meta: BuiltinServerInstallMeta = { tagName: release.tag_name, assetName: asset.name, executablePath }
-  await fsp.mkdir(root, { recursive: true })
-  await fsp.writeFile(metaPath, JSON.stringify(meta, null, 2))
-  return meta
 }
 
 async function startConnector(input: StartConnectorInput) {
@@ -646,7 +603,7 @@ async function startConnector(input: StartConnectorInput) {
       id: connectorID,
       running: false,
       phase: "checking",
-      message: "Checking latest connector release",
+      message: "Preparing bundled connector",
       serverURL,
       version: "",
       mode: input.mode,
@@ -655,8 +612,8 @@ async function startConnector(input: StartConnectorInput) {
   })
   emitDesktopProcessStatus()
   try {
-    updateConnectorStatus(connectorID, { phase: "checking", message: "Checking latest connector release", serverURL, mode: input.mode })
-    const install = await ensureLatestConnectorInstall(connectorID)
+    updateConnectorStatus(connectorID, { phase: "checking", message: "Preparing bundled connector", serverURL, mode: input.mode })
+    const install = await ensureLatestConnectorInstall()
     updateConnectorStatus(connectorID, { phase: "starting", message: "Starting connector", serverURL, version: install.tagName, mode: input.mode })
     const args = ["-server", serverURL, "-token", token]
     if (input.mode === "web_server") {
@@ -805,26 +762,6 @@ async function installPreparedDesktopUpdate() {
   return { ok: true, message: "Installer started" }
 }
 
-async function readInstallMeta(metaPath: string) {
-  try {
-    const raw = await fsp.readFile(metaPath, "utf8")
-    return JSON.parse(raw) as BuiltinServerInstallMeta
-  } catch {
-    return null
-  }
-}
-
-function selectReleaseAsset(assets: GitHubReleaseAsset[], preferredKeyword: string) {
-  let best: { asset: GitHubReleaseAsset; score: number } | null = null
-  for (const asset of assets) {
-    const score = scoreAsset(asset.name, preferredKeyword)
-    if (score > (best?.score ?? -1)) {
-      best = { asset, score }
-    }
-  }
-  return best && best.score > 0 ? best.asset : null
-}
-
 function selectDesktopUpdateAsset(assets: GitHubReleaseAsset[]) {
   const suffixes = desktopUpdateSuffixes()
   return assets.find((asset) => {
@@ -851,157 +788,6 @@ function desktopUpdateSuffixes() {
     return [`-linux-${arch}.appimage`, `-linux-${arch}.deb`]
   }
   return []
-}
-
-function scoreAsset(name: string, preferredKeyword: string) {
-  const normalized = name.toLowerCase()
-  let score = 0
-  if (!/\.(zip|tar\.gz|tgz|exe)$/.test(normalized)) {
-    return -1
-  }
-  if (!assetRuntimeSuffixMatches(normalized)) {
-    return -1
-  }
-  if (preferredKeyword && normalized.includes(preferredKeyword.toLowerCase())) {
-    score += 20
-  }
-  if (normalized.includes("veloce")) {
-    score += 5
-  }
-  if (process.platform === "win32") {
-    score += normalized.endsWith(".exe") ? 10 : 6
-  } else if (process.platform === "linux") {
-    score += 8
-  } else if (process.platform === "darwin") {
-    score += 8
-  }
-  score += 8
-  score += 4
-  return score
-}
-
-function assetRuntimeSuffixMatches(normalizedName: string) {
-  const platform = releaseAssetPlatform()
-  const arch = releaseAssetArch()
-  if (!platform || !arch) {
-    return false
-  }
-  return releaseAssetExtensions().some((extension) => normalizedName.endsWith(`-${platform}-${arch}${extension}`))
-}
-
-function releaseAssetPlatform() {
-  if (process.platform === "win32") {
-    return "windows"
-  }
-  if (process.platform === "linux") {
-    return "linux"
-  }
-  if (process.platform === "darwin") {
-    return "darwin"
-  }
-  return ""
-}
-
-function releaseAssetArch() {
-  if (process.arch === "x64") {
-    return "amd64"
-  }
-  if (process.arch === "arm64") {
-    return "arm64"
-  }
-  return ""
-}
-
-function releaseAssetExtensions() {
-  return process.platform === "win32" ? [".zip", ".exe", ".tar.gz", ".tgz"] : [".tar.gz", ".tgz", ".zip"]
-}
-
-async function installDownloadedAsset(downloadPath: string, versionDir: string) {
-  const lower = downloadPath.toLowerCase()
-  if (process.platform === "win32" && lower.endsWith(".exe")) {
-    const targetPath = path.join(versionDir, path.basename(downloadPath))
-    await fsp.copyFile(downloadPath, targetPath)
-    return targetPath
-  }
-
-  if (/\.(zip|tar\.gz|tgz)$/.test(lower)) {
-    extractArchive(downloadPath, versionDir)
-  } else {
-    const targetPath = path.join(versionDir, path.basename(downloadPath))
-    await fsp.copyFile(downloadPath, targetPath)
-    if (process.platform !== "win32") {
-      await fsp.chmod(targetPath, 0o755)
-    }
-    return targetPath
-  }
-
-  const executablePath = await findCommunityExecutable(versionDir)
-  if (!executablePath) {
-    throw new Error("Downloaded community release does not contain an executable")
-  }
-  if (process.platform !== "win32") {
-    await fsp.chmod(executablePath, 0o755)
-  }
-  return executablePath
-}
-
-function extractArchive(archivePath: string, destination: string) {
-  const tar = spawnSync("tar", ["-xf", archivePath, "-C", destination], { stdio: "ignore" })
-  if (tar.status === 0) {
-    return
-  }
-
-  const fallback = process.platform === "win32"
-    ? spawnSync("powershell.exe", ["-NoProfile", "-Command", "Expand-Archive -LiteralPath $args[0] -DestinationPath $args[1] -Force", archivePath, destination], { stdio: "ignore" })
-    : spawnSync("unzip", ["-q", "-o", archivePath, "-d", destination], { stdio: "ignore" })
-
-  if (fallback.status !== 0) {
-    throw new Error("Failed to extract community release")
-  }
-}
-
-async function findCommunityExecutable(root: string): Promise<string | null> {
-  const entries = await fsp.readdir(root, { withFileTypes: true })
-  const files: string[] = []
-  for (const entry of entries) {
-    const fullPath = path.join(root, entry.name)
-    if (entry.isDirectory()) {
-      const nested = await findCommunityExecutable(fullPath)
-      if (nested) {
-        files.push(nested)
-      }
-    } else if (isExecutableCandidate(entry.name)) {
-      files.push(fullPath)
-    }
-  }
-  files.sort((left, right) => executableScore(right) - executableScore(left))
-  return files[0] || null
-}
-
-function isExecutableCandidate(name: string) {
-  const normalized = name.toLowerCase()
-  if (process.platform === "win32") {
-    return normalized.endsWith(".exe")
-  }
-  return !/\.(txt|md|json|yaml|yml|html|css|js|map|so|dll|dylib)$/.test(normalized)
-}
-
-function executableScore(filePath: string) {
-  const normalized = path.basename(filePath).toLowerCase()
-  let score = 0
-  if (normalized.includes("community")) {
-    score += 20
-  }
-  if (normalized.includes("veloce")) {
-    score += 10
-  }
-  if (normalized.includes("flai")) {
-    score += 5
-  }
-  if (normalized.endsWith(".exe")) {
-    score += 3
-  }
-  return score
 }
 
 function safePathSegment(value: string) {

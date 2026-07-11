@@ -11,6 +11,8 @@ permissions:
 
 env:
   WEB_REPOSITORY: WindyPear-Team/veloce-web
+  COMMUNITY_REPOSITORY: WindyPear-Team/veloce
+  CONNECTOR_REPOSITORY: WindyPear-Team/veloce-app
 
 jobs:
   build:
@@ -23,21 +25,33 @@ jobs:
           - os: linux
             runner: ubuntu-latest
             arch: x64
+            goos: linux
+            goarch: amd64
           - os: linux
             runner: ubuntu-latest
             arch: arm64
+            goos: linux
+            goarch: arm64
           - os: windows
             runner: windows-latest
             arch: x64
+            goos: windows
+            goarch: amd64
           - os: windows
             runner: windows-latest
             arch: arm64
+            goos: windows
+            goarch: arm64
           - os: mac
             runner: macos-latest
             arch: x64
+            goos: darwin
+            goarch: amd64
           - os: mac
             runner: macos-latest
             arch: arm64
+            goos: darwin
+            goarch: arm64
 
     steps:
       - name: Checkout desktop
@@ -53,6 +67,28 @@ jobs:
           ref: ${{ github.ref_name }}
           path: web
           token: ${{ secrets.CHECKOUT_TOKEN || github.token }}
+
+      - name: Checkout community backend
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.COMMUNITY_REPOSITORY }}
+          ref: ${{ github.ref_name }}
+          path: community
+          token: ${{ secrets.CHECKOUT_TOKEN || github.token }}
+
+      - name: Checkout connector
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CONNECTOR_REPOSITORY }}
+          ref: ${{ github.ref_name }}
+          path: connector
+          token: ${{ secrets.CHECKOUT_TOKEN || github.token }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: community/go.mod
+          cache-dependency-path: community/go.sum
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -80,6 +116,11 @@ jobs:
 
       - name: Build desktop app
         working-directory: desktop
+        env:
+          VELOCE_RUNTIME_GOOS: ${{ matrix.goos }}
+          VELOCE_RUNTIME_GOARCH: ${{ matrix.goarch }}
+          VELOCE_CONNECTOR_SOURCE: ../connector
+          VELOCE_RUNTIME_VERSION: ${{ github.ref_name }}
         run: npm run build
 
       - name: Build installer

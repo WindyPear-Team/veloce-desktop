@@ -13,8 +13,9 @@
     "install:mirror": "node scripts/install-with-mirror.mjs",
     "install:electron": "node scripts/install-electron-with-mirror.mjs",
     "build:web": "npm --prefix ../web run build:desktop",
+    "build:runtimes": "node scripts/build-runtimes.mjs",
     "build:electron": "tsc -p tsconfig.json",
-    "build": "npm run build:web && npm run build:electron",
+    "build": "npm run build:web && npm run build:runtimes && npm run build:electron",
     "dist": "npm run build && electron-builder",
     "start": "npm run build && electron ."
   },
@@ -29,6 +30,15 @@
       "dist/**/*",
       "assets/**/*",
       "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/bin",
+        "to": "bin",
+        "filter": [
+          "**/*"
+        ]
+      }
     ],
     "mac": {
       "target": [
