@@ -73,6 +73,8 @@ contextBridge.exposeInMainWorld("veloceDesktop", {
   chooseDesktopFile: () => ipcRenderer.invoke("desktop-settings:choose-file") as Promise<string>,
   getDesktopSystemInfo: () => ipcRenderer.invoke("desktop:get-system-info") as Promise<{ hostname: string; platform: string }>,
   openInVSCode: (workspacePath: string) => ipcRenderer.invoke("desktop:open-in-vscode", workspacePath) as Promise<{ ok: boolean; message: string }>,
+  runDesktopMenuAction: (action: "new-window" | "quit" | "close-window" | "copy" | "paste" | "cut" | "delete" | "undo" | "redo") => ipcRenderer.invoke("desktop:menu-action", action) as Promise<{ ok: boolean }>,
+  openDesktopLink: (target: "official-site" | "github") => ipcRenderer.invoke("desktop:open-link", target) as Promise<{ ok: boolean }>,
   checkDesktopUpdate: () => ipcRenderer.invoke("desktop-update:check") as Promise<DesktopUpdateResult>,
   installPreparedDesktopUpdate: () => ipcRenderer.invoke("desktop-update:install-prepared") as Promise<{ ok: boolean; message: string }>,
   getDesktopTabInitialState: () => ipcRenderer.invoke("desktop-tabs:get-initial-state") as Promise<{ windowID: number; tab: DesktopTab | null }>,

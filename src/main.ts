@@ -461,6 +461,45 @@ function setupBuiltinServerIPC() {
   ipcMain.handle("desktop-settings:choose-file", async () => chooseDesktopExecutable())
   ipcMain.handle("desktop:get-system-info", () => ({ hostname: os.hostname(), platform: process.platform }))
   ipcMain.handle("desktop:open-in-vscode", async (_event, workspacePath: string) => openWorkspaceInVSCode(workspacePath))
+  ipcMain.handle("desktop:menu-action", (event, action: unknown) => {
+    const window = BrowserWindow.fromWebContents(event.sender)
+    if (action === "new-window") {
+      const nextWindow = createWindow()
+      nextWindow.show()
+      nextWindow.focus()
+      return { ok: true }
+    }
+    if (action === "close-window") {
+      window?.destroy()
+      return { ok: true }
+    }
+    if (action === "quit") {
+      isQuitting = true
+      app.quit()
+      return { ok: true }
+    }
+    if (!window || !["copy", "paste", "cut", "delete", "undo", "redo"].includes(String(action))) {
+      return { ok: false }
+    }
+    const contents = window.webContents
+    if (action === "copy") contents.copy()
+    if (action === "paste") contents.paste()
+    if (action === "cut") contents.cut()
+    if (action === "delete") contents.delete()
+    if (action === "undo") contents.undo()
+    if (action === "redo") contents.redo()
+    return { ok: true }
+  })
+  ipcMain.handle("desktop:open-link", async (_event, target: unknown) => {
+    const links: Record<string, string> = {
+      "official-site": "https://veloce.flweb.cn",
+      github: "https://github.com/WindyPear-Team/veloce-desktop",
+    }
+    const url = typeof target === "string" ? links[target] : undefined
+    if (!url) return { ok: false }
+    await shell.openExternal(url)
+    return { ok: true }
+  })
   ipcMain.handle("desktop-update:check", async () => checkDesktopUpdate())
   ipcMain.handle("desktop-update:install-prepared", async () => installPreparedDesktopUpdate())
   ipcMain.handle("desktop-tabs:get-initial-state", (event) => {
