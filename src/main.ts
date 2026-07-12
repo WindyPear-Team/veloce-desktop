@@ -19,6 +19,7 @@ let tray: Tray | null = null
 let isQuitting = false
 let builtinServerEnabled = false
 let builtinServerProcess: ChildProcess | null = null
+const initialWindowTabs = new Map<number, DesktopTab>()
 
 type BuiltinServerPhase = "idle" | "checking" | "downloading" | "starting" | "running" | "error"
 type ManagedProcessKind = "builtin-server" | "connector"
@@ -101,6 +102,13 @@ interface ManagedProcessStatus {
 interface DesktopProcessStatus {
   generatedAt: string
   processes: ManagedProcessStatus[]
+}
+
+interface DesktopTab {
+  id: string
+  title: string
+  serverURL: string
+  path: string
 }
 
 interface ManagedConnectorProcess {
@@ -427,7 +435,9 @@ function getDesktopProcessStatus(): DesktopProcessStatus {
 }
 
 function emitDesktopProcessStatus() {
-  mainWindow?.webContents.send("desktop-processes:status", getDesktopProcessStatus())
+  for (const window of BrowserWindow.getAllWindows()) {
+    window.webContents.send("desktop-processes:status", getDesktopProcessStatus())
+  }
 }
 
 function setupBuiltinServerIPC() {
@@ -453,6 +463,59 @@ function setupBuiltinServerIPC() {
   ipcMain.handle("desktop:open-in-vscode", async (_event, workspacePath: string) => openWorkspaceInVSCode(workspacePath))
   ipcMain.handle("desktop-update:check", async () => checkDesktopUpdate())
   ipcMain.handle("desktop-update:install-prepared", async () => installPreparedDesktopUpdate())
+  ipcMain.handle("desktop-tabs:get-initial-state", (event) => {
+    const window = BrowserWindow.fromWebContents(event.sender)
+    return { windowID: window?.id || 0, tab: window ? initialWindowTabs.get(window.id) || null : null }
+  })
+  ipcMain.handle("desktop-tabs:detach", (event, input: unknown) => detachDesktopTab(event.sender, input))
+}
+
+function detachDesktopTab(sender: Electron.WebContents, input: unknown) {
+  const sourceWindow = BrowserWindow.fromWebContents(sender)
+  const tab = normalizeDesktopTab(input)
+  if (!sourceWindow || !tab) {
+    return { moved: false }
+  }
+  const point = isRecord(input) ? input : {}
+  const screenX = finiteNumber(point.screenX)
+  const screenY = finiteNumber(point.screenY)
+  const targetWindow = BrowserWindow.getAllWindows().find((window) => {
+    if (window.id === sourceWindow.id || window.isDestroyed()) {
+      return false
+    }
+    const bounds = window.getBounds()
+    return screenX >= bounds.x && screenX <= bounds.x + bounds.width && screenY >= bounds.y && screenY <= bounds.y + bounds.height
+  })
+  if (targetWindow) {
+    targetWindow.webContents.send("desktop-tabs:received", tab)
+    targetWindow.show()
+    targetWindow.focus()
+    return { moved: true, targetWindowID: targetWindow.id }
+  }
+  const window = createWindow(tab)
+  return { moved: Boolean(window), targetWindowID: window?.id || 0 }
+}
+
+function normalizeDesktopTab(value: unknown): DesktopTab | null {
+  if (!isRecord(value)) {
+    return null
+  }
+  const id = typeof value.id === "string" && /^[a-zA-Z0-9_-]{1,80}$/.test(value.id) ? value.id : ""
+  if (!id) {
+    return null
+  }
+  const title = typeof value.title === "string" ? value.title.trim().slice(0, 40) : "Chat"
+  const serverURL = typeof value.serverURL === "string" ? value.serverURL.trim().slice(0, 2048) : ""
+  const pagePath = typeof value.path === "string" && value.path.startsWith("/") ? value.path.slice(0, 1024) : "/chat"
+  return { id, title: title || "Chat", serverURL, path: pagePath }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object"
+}
+
+function finiteNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : -1
 }
 
 async function openWorkspaceInVSCode(workspacePath: string) {
@@ -881,8 +944,8 @@ function createTray() {
   tray.on("click", showMainWindow)
 }
 
-function createWindow() {
-  mainWindow = new BrowserWindow({
+function createWindow(initialTab?: DesktopTab) {
+  const window = new BrowserWindow({
     width: 1280,
     height: 860,
     minWidth: 960,
@@ -903,9 +966,15 @@ function createWindow() {
     },
   })
 
-  mainWindow.webContents.on("will-navigate", handleNavigationURL)
-  mainWindow.webContents.on("will-redirect", handleNavigationURL)
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+  if (initialTab) {
+    initialWindowTabs.set(window.id, initialTab)
+  }
+  if (!mainWindow) {
+    mainWindow = window
+  }
+  window.webContents.on("will-navigate", handleNavigationURL)
+  window.webContents.on("will-redirect", handleNavigationURL)
+  window.webContents.setWindowOpenHandler(({ url }) => {
     const token = tokenFromURL(url)
     if (token) {
       loadLocalApp(`/chat?token=${encodeURIComponent(token)}`)
@@ -914,18 +983,22 @@ function createWindow() {
     }
     return { action: "deny" }
   })
-  mainWindow.on("close", (event) => {
-    if (isQuitting) {
+  window.on("close", (event) => {
+    if (isQuitting || window !== mainWindow) {
       return
     }
     event.preventDefault()
-    mainWindow?.hide()
+    window.hide()
   })
-  mainWindow.on("closed", () => {
-    mainWindow = null
+  window.on("closed", () => {
+    initialWindowTabs.delete(window.id)
+    if (mainWindow === window) {
+      mainWindow = BrowserWindow.getAllWindows().find((candidate) => candidate !== window) || null
+    }
   })
 
-  loadLocalApp()
+  void window.loadFile(indexPath)
+  return window
 }
 
 if (gotSingleInstanceLock) {

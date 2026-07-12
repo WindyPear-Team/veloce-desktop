@@ -57,6 +57,13 @@ interface DesktopUpdateResult {
   filePath?: string
 }
 
+interface DesktopTab {
+  id: string
+  title: string
+  serverURL: string
+  path: string
+}
+
 contextBridge.exposeInMainWorld("veloceDesktop", {
   getBuiltinServerStatus: () => ipcRenderer.invoke("builtin-server:get-status") as Promise<BuiltinServerStatus>,
   getDesktopProcessStatus: () => ipcRenderer.invoke("desktop-processes:get-status") as Promise<DesktopProcessStatus>,
@@ -68,6 +75,8 @@ contextBridge.exposeInMainWorld("veloceDesktop", {
   openInVSCode: (workspacePath: string) => ipcRenderer.invoke("desktop:open-in-vscode", workspacePath) as Promise<{ ok: boolean; message: string }>,
   checkDesktopUpdate: () => ipcRenderer.invoke("desktop-update:check") as Promise<DesktopUpdateResult>,
   installPreparedDesktopUpdate: () => ipcRenderer.invoke("desktop-update:install-prepared") as Promise<{ ok: boolean; message: string }>,
+  getDesktopTabInitialState: () => ipcRenderer.invoke("desktop-tabs:get-initial-state") as Promise<{ windowID: number; tab: DesktopTab | null }>,
+  detachDesktopTab: (input: DesktopTab & { screenX: number; screenY: number }) => ipcRenderer.invoke("desktop-tabs:detach", input) as Promise<{ moved: boolean; targetWindowID?: number }>,
   setBuiltinServerEnabled: (enabled: boolean) => ipcRenderer.invoke("builtin-server:set-enabled", enabled) as Promise<BuiltinServerStatus>,
   startConnector: (input: StartConnectorInput) => ipcRenderer.invoke("connector:start", input) as Promise<StartConnectorResult>,
   onBuiltinServerStatus: (callback: (status: BuiltinServerStatus) => void) => {
@@ -79,5 +88,10 @@ contextBridge.exposeInMainWorld("veloceDesktop", {
     const listener = (_event: Electron.IpcRendererEvent, status: DesktopProcessStatus) => callback(status)
     ipcRenderer.on("desktop-processes:status", listener)
     return () => ipcRenderer.off("desktop-processes:status", listener)
+  },
+  onDesktopTabReceived: (callback: (tab: DesktopTab) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, tab: DesktopTab) => callback(tab)
+    ipcRenderer.on("desktop-tabs:received", listener)
+    return () => ipcRenderer.off("desktop-tabs:received", listener)
   },
 })
