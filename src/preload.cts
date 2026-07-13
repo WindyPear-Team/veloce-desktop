@@ -74,6 +74,8 @@ contextBridge.exposeInMainWorld("veloceDesktop", {
   chooseDesktopFolder: (initialPath?: string) => ipcRenderer.invoke("desktop:choose-folder", initialPath) as Promise<string>,
   getDesktopSystemInfo: () => ipcRenderer.invoke("desktop:get-system-info") as Promise<{ hostname: string; platform: string; instanceID: string }>,
   openInVSCode: (workspacePath: string) => ipcRenderer.invoke("desktop:open-in-vscode", workspacePath) as Promise<{ ok: boolean; message: string }>,
+  notifyTaskComplete: (input: { id: string; title: string; body: string }) => ipcRenderer.invoke("desktop:notify-task-complete", input) as Promise<{ ok: boolean; duplicate?: boolean }>,
+  notifyConnectorApproval: (input: { id: string; taskID: string; title: string; body: string; approveLabel: string; rejectLabel: string }) => ipcRenderer.invoke("desktop:notify-connector-approval", input) as Promise<{ ok: boolean; duplicate?: boolean }>,
   runDesktopMenuAction: (action: "new-window" | "quit" | "close-window" | "copy" | "paste" | "cut" | "delete" | "undo" | "redo") => ipcRenderer.invoke("desktop:menu-action", action) as Promise<{ ok: boolean }>,
   openDesktopLink: (target: "official-site" | "github") => ipcRenderer.invoke("desktop:open-link", target) as Promise<{ ok: boolean }>,
   openExternalURL: (url: string) => ipcRenderer.invoke("desktop:open-external-url", url) as Promise<{ ok: boolean }>,
@@ -100,6 +102,11 @@ contextBridge.exposeInMainWorld("veloceDesktop", {
     const listener = (_event: Electron.IpcRendererEvent, tab: DesktopTab) => callback(tab)
     ipcRenderer.on("desktop-tabs:received", listener)
     return () => ipcRenderer.off("desktop-tabs:received", listener)
+  },
+  onConnectorApprovalDecision: (callback: (input: { taskID: string; approved: boolean }) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, input: { taskID: string; approved: boolean }) => callback(input)
+    ipcRenderer.on("desktop:connector-approval-decision", listener)
+    return () => ipcRenderer.off("desktop:connector-approval-decision", listener)
   },
   onBrowserState: (callback: (state: unknown) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, state: unknown) => callback(state)

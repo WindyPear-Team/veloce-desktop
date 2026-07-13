@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, Tray, WebContentsView, dialog, ipcMain, shell } from "electron"
+import { app, BrowserWindow, Menu, Notification, Tray, WebContentsView, dialog, ipcMain, shell } from "electron"
 import { spawn, spawnSync } from "node:child_process"
 import type { ChildProcess } from "node:child_process"
 import fs from "node:fs"
@@ -20,6 +20,10 @@ let browserWindow: BrowserWindow | null = null
 let browserToolbarView: WebContentsView | null = null
 let tray: Tray | null = null
 let isQuitting = false
+const desktopProtocolScheme = "veloce"
+const desktopTaskNotificationIDs = new Set<string>()
+const desktopApprovalNotificationIDs = new Set<string>()
+const desktopApprovalNotificationOwners = new Map<string, Electron.WebContents>()
 let builtinServerEnabled = false
 let builtinServerProcess: ChildProcess | null = null
 const initialWindowTabs = new Map<number, DesktopTab>()
@@ -166,7 +170,50 @@ if (!gotSingleInstanceLock) {
   app.quit()
 }
 
-app.on("second-instance", showMainWindow)
+app.on("second-instance", (_event, commandLine) => {
+  handleDesktopProtocolArguments(commandLine)
+  showMainWindow()
+})
+
+function registerDesktopProtocol() {
+  if (process.platform !== "win32") {
+    return
+  }
+  app.setAppUserModelId("com.windypear.veloce.desktop.beta")
+  if (process.defaultApp && process.argv[1]) {
+    app.setAsDefaultProtocolClient(desktopProtocolScheme, process.execPath, [path.resolve(process.argv[1])])
+    return
+  }
+  app.setAsDefaultProtocolClient(desktopProtocolScheme)
+}
+
+function handleDesktopProtocolArguments(args: readonly string[]) {
+  const rawURL = args.find((arg) => arg.startsWith(`${desktopProtocolScheme}://`))
+  if (!rawURL) {
+    return
+  }
+  handleDesktopProtocolURL(rawURL)
+}
+
+function handleDesktopProtocolURL(rawURL: string) {
+  try {
+    const url = new URL(rawURL)
+    if (url.protocol !== `${desktopProtocolScheme}:` || url.hostname !== "connector-approval") {
+      return
+    }
+    const taskID = url.searchParams.get("task") || ""
+    const decision = url.searchParams.get("decision")
+    if (!/^[A-Za-z0-9_-]{1,160}$/.test(taskID) || (decision !== "approve" && decision !== "reject")) {
+      return
+    }
+    const owner = desktopApprovalNotificationOwners.get(taskID)
+    if (owner && !owner.isDestroyed()) {
+      owner.send("desktop:connector-approval-decision", { taskID, approved: decision === "approve" })
+    }
+  } catch {
+    // Ignore malformed protocol activations.
+  }
+}
 
 function tokenFromURL(rawURL: string) {
   try {
@@ -355,6 +402,7 @@ function openDesktopBrowser(rawURL?: string) {
       minHeight: 520,
       title: "Veloce Browser",
       icon: iconPath,
+      ...(process.platform === "win32" ? { backgroundMaterial: "acrylic" as const } : {}),
       titleBarStyle: "hidden",
       titleBarOverlay: {
         color: "#ffffff00",
@@ -724,6 +772,8 @@ function setupBuiltinServerIPC() {
   ipcMain.handle("desktop:choose-folder", async (_event, initialPath: unknown) => chooseDesktopFolder(initialPath))
   ipcMain.handle("desktop:get-system-info", () => ({ hostname: os.hostname(), platform: process.platform, instanceID: desktopInstanceID() }))
   ipcMain.handle("desktop:open-in-vscode", async (_event, workspacePath: string) => openWorkspaceInVSCode(workspacePath))
+  ipcMain.handle("desktop:notify-task-complete", (event, input: unknown) => showDesktopTaskNotification(event.sender, input))
+  ipcMain.handle("desktop:notify-connector-approval", (event, input: unknown) => showDesktopApprovalNotification(event.sender, input))
   ipcMain.handle("desktop:menu-action", (event, action: unknown) => {
     const window = BrowserWindow.fromWebContents(event.sender)
     if (action === "new-window") {
@@ -973,6 +1023,90 @@ async function bundledRuntimeInstall(binaryName: string, label: string) {
     assetName: executableName,
     executablePath,
   }
+}
+
+function showDesktopTaskNotification(sender: Electron.WebContents, input: unknown) {
+  if (!isRecord(input)) {
+    return { ok: false }
+  }
+  const id = typeof input.id === "string" ? input.id.trim().slice(0, 240) : ""
+  const title = typeof input.title === "string" ? input.title.trim().slice(0, 120) : ""
+  const body = typeof input.body === "string" ? input.body.trim().slice(0, 360) : ""
+  if (!id || !title || desktopTaskNotificationIDs.has(id)) {
+    return { ok: Boolean(id && title), duplicate: Boolean(id && desktopTaskNotificationIDs.has(id)) }
+  }
+  try {
+    desktopTaskNotificationIDs.add(id)
+    const cleanup = setTimeout(() => desktopTaskNotificationIDs.delete(id), 10 * 60 * 1000)
+    cleanup.unref()
+    const notification = new Notification({ title, body, icon: iconPath })
+    notification.on("click", () => {
+      const owner = BrowserWindow.fromWebContents(sender)
+      if (owner && !owner.isDestroyed()) {
+        owner.show()
+        owner.focus()
+      }
+    })
+    notification.show()
+    return { ok: true }
+  } catch {
+    desktopTaskNotificationIDs.delete(id)
+    return { ok: false }
+  }
+}
+
+function showDesktopApprovalNotification(sender: Electron.WebContents, input: unknown) {
+  if (!isRecord(input)) {
+    return { ok: false }
+  }
+  const id = typeof input.id === "string" ? input.id.trim().slice(0, 240) : ""
+  const taskID = typeof input.taskID === "string" ? input.taskID.trim() : ""
+  const title = typeof input.title === "string" ? input.title.trim().slice(0, 120) : ""
+  const body = typeof input.body === "string" ? input.body.trim().slice(0, 360) : ""
+  const approveLabel = typeof input.approveLabel === "string" ? input.approveLabel.trim().slice(0, 40) : "Approve"
+  const rejectLabel = typeof input.rejectLabel === "string" ? input.rejectLabel.trim().slice(0, 40) : "Reject"
+  if (!id || !title || !/^[A-Za-z0-9_-]{1,160}$/.test(taskID) || desktopApprovalNotificationIDs.has(id)) {
+    return { ok: Boolean(id && title && taskID), duplicate: Boolean(id && desktopApprovalNotificationIDs.has(id)) }
+  }
+  try {
+    desktopApprovalNotificationIDs.add(id)
+    desktopApprovalNotificationOwners.set(taskID, sender)
+    const cleanup = setTimeout(() => {
+      desktopApprovalNotificationIDs.delete(id)
+      desktopApprovalNotificationOwners.delete(taskID)
+    }, 10 * 60 * 1000)
+    cleanup.unref()
+    const options = {
+      title,
+      body,
+      icon: iconPath,
+      ...(process.platform === "win32" ? { toastXml: desktopApprovalToastXML(taskID, title, body, approveLabel, rejectLabel) } : {}),
+    }
+    const notification = new Notification(options)
+    notification.on("click", () => {
+      const owner = BrowserWindow.fromWebContents(sender)
+      if (owner && !owner.isDestroyed()) {
+        owner.show()
+        owner.focus()
+      }
+    })
+    notification.show()
+    return { ok: true }
+  } catch {
+    desktopApprovalNotificationIDs.delete(id)
+    desktopApprovalNotificationOwners.delete(taskID)
+    return { ok: false }
+  }
+}
+
+function desktopApprovalToastXML(taskID: string, title: string, body: string, approveLabel: string, rejectLabel: string) {
+  const approveURL = `${desktopProtocolScheme}://connector-approval?task=${encodeURIComponent(taskID)}&decision=approve`
+  const rejectURL = `${desktopProtocolScheme}://connector-approval?task=${encodeURIComponent(taskID)}&decision=reject`
+  return `<toast scenario="reminder"><visual><binding template="ToastGeneric"><text>${escapeToastXML(title)}</text><text>${escapeToastXML(body)}</text></binding></visual><actions><action content="${escapeToastXML(approveLabel || "Approve")}" arguments="${escapeToastXML(approveURL)}" activationType="protocol"/><action content="${escapeToastXML(rejectLabel || "Reject")}" arguments="${escapeToastXML(rejectURL)}" activationType="protocol"/></actions></toast>`
+}
+
+function escapeToastXML(value: string) {
+  return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&apos;" })[character] || character)
 }
 
 function handleBrowserAction(input: unknown) {
@@ -1466,6 +1600,7 @@ function createWindow(initialTab?: DesktopTab) {
     minHeight: 640,
     title: "Veloce",
     icon: iconPath,
+    ...(process.platform === "win32" ? { backgroundMaterial: "acrylic" as const } : {}),
     titleBarStyle: "hidden",
     titleBarOverlay: {
       color: "#ffffff00",
@@ -1519,6 +1654,8 @@ if (gotSingleInstanceLock) {
   setupBuiltinServerIPC()
 
   app.whenReady().then(async () => {
+    registerDesktopProtocol()
+    handleDesktopProtocolArguments(process.argv)
     desktopSettings = await readDesktopSettings()
     applyDesktopProxySettings()
     const config = await readBuiltinServerConfig()
