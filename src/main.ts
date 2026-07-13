@@ -78,6 +78,7 @@ interface StartConnectorInput {
   deviceKind?: "cli" | "desktop"
   desktopInstanceID?: string
   restart?: boolean
+  watchdogAttempt?: number
 }
 
 interface ConnectorStatus {
@@ -122,6 +123,9 @@ interface DesktopTab {
 interface ManagedConnectorProcess {
   process: ChildProcess | null
   status: ConnectorStatus
+  restartInput: StartConnectorInput
+  restartAttempt: number
+  stopRequested: boolean
 }
 
 let builtinServerStatus: BuiltinServerStatus = {
@@ -135,6 +139,7 @@ let builtinServerStatus: BuiltinServerStatus = {
 
 const connectorProcesses = new Map<string, ManagedConnectorProcess>()
 const desktopConnectorEnsureRequests = new Map<string, Promise<{ ok: boolean; message: string; version: string }>>()
+const connectorRestartTimers = new Map<string, NodeJS.Timeout>()
 
 let desktopSettings: DesktopSettings = {
   httpProxy: "",
@@ -504,6 +509,7 @@ function setupBuiltinServerIPC() {
   ipcMain.handle("desktop-settings:get", () => desktopSettingsForRenderer())
   ipcMain.handle("desktop-settings:save", async (_event, input: DesktopSettings) => writeDesktopSettings(input))
   ipcMain.handle("desktop-settings:choose-file", async () => chooseDesktopExecutable())
+  ipcMain.handle("desktop:choose-folder", async (_event, initialPath: unknown) => chooseDesktopFolder(initialPath))
   ipcMain.handle("desktop:get-system-info", () => ({ hostname: os.hostname(), platform: process.platform, instanceID: desktopInstanceID() }))
   ipcMain.handle("desktop:open-in-vscode", async (_event, workspacePath: string) => openWorkspaceInVSCode(workspacePath))
   ipcMain.handle("desktop:menu-action", (event, action: unknown) => {
@@ -544,6 +550,21 @@ function setupBuiltinServerIPC() {
     if (!url) return { ok: false }
     await shell.openExternal(url)
     return { ok: true }
+  })
+  ipcMain.handle("desktop:open-external-url", async (_event, rawURL: unknown) => {
+    if (typeof rawURL !== "string") {
+      return { ok: false }
+    }
+    try {
+      const url = new URL(rawURL)
+      if (url.protocol !== "https:" && url.protocol !== "http:") {
+        return { ok: false }
+      }
+      await shell.openExternal(url.toString())
+      return { ok: true }
+    } catch {
+      return { ok: false }
+    }
   })
   ipcMain.handle("desktop-update:check", async () => checkDesktopUpdate())
   ipcMain.handle("desktop-update:install-prepared", async () => installPreparedDesktopUpdate())
@@ -737,6 +758,43 @@ async function bundledRuntimeInstall(binaryName: string, label: string) {
   }
 }
 
+function clearConnectorRestart(connectorID: string) {
+  const timer = connectorRestartTimers.get(connectorID)
+  if (timer) {
+    clearTimeout(timer)
+    connectorRestartTimers.delete(connectorID)
+  }
+}
+
+function scheduleConnectorRestart(connectorID: string) {
+  const connector = connectorProcesses.get(connectorID)
+  if (!connector || connector.stopRequested || isQuitting) {
+    return
+  }
+  clearConnectorRestart(connectorID)
+  const nextAttempt = connector.restartAttempt + 1
+  const delay = Math.min(30_000, 1_000 * 2 ** Math.min(nextAttempt - 1, 5))
+  connector.restartAttempt = nextAttempt
+  connector.status = {
+    ...connector.status,
+    running: false,
+    phase: "checking",
+    message: `Connector exited; restarting in ${Math.ceil(delay / 1000)}s`,
+  }
+  emitDesktopProcessStatus()
+  const timer = setTimeout(() => {
+    connectorRestartTimers.delete(connectorID)
+    const current = connectorProcesses.get(connectorID)
+    if (!current || current.stopRequested || isQuitting) {
+      return
+    }
+    connectorProcesses.delete(connectorID)
+    void startConnector({ ...current.restartInput, restart: true, watchdogAttempt: current.restartAttempt })
+  }, delay)
+  timer.unref()
+  connectorRestartTimers.set(connectorID, timer)
+}
+
 async function startConnector(input: StartConnectorInput) {
   const serverURL = input.serverURL.trim()
   const token = input.token.trim()
@@ -754,12 +812,17 @@ async function startConnector(input: StartConnectorInput) {
     return { ok: true, message: "Connector is already running", version: existing.status.version }
   }
   if (existing) {
+    existing.stopRequested = true
+    clearConnectorRestart(existing.status.id)
     existing.process?.kill()
     connectorProcesses.delete(existing.status.id)
   }
   const connectorID = `connector-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   connectorProcesses.set(connectorID, {
     process: null,
+    restartInput: { ...input, restart: false },
+    restartAttempt: input.watchdogAttempt || 0,
+    stopRequested: false,
     status: {
       id: connectorID,
       running: false,
@@ -802,8 +865,20 @@ async function startConnector(input: StartConnectorInput) {
       connector.process = childProcess
     }
     childProcess.on("exit", () => {
-      connectorProcesses.delete(connectorID)
-      emitDesktopProcessStatus()
+      const current = connectorProcesses.get(connectorID)
+      if (!current || current !== connector) {
+        return
+      }
+      current.process = null
+      scheduleConnectorRestart(connectorID)
+    })
+    childProcess.on("error", () => {
+      const current = connectorProcesses.get(connectorID)
+      if (!current || current !== connector) {
+        return
+      }
+      current.process = null
+      scheduleConnectorRestart(connectorID)
     })
     childProcess.unref()
     updateConnectorStatus(connectorID, {
@@ -901,6 +976,8 @@ function terminateManagedProcess(id: string) {
   if (!connector) {
     return getDesktopProcessStatus()
   }
+  connector.stopRequested = true
+  clearConnectorRestart(id)
   connector.process?.kill()
   connectorProcesses.delete(id)
   emitDesktopProcessStatus()
@@ -909,6 +986,8 @@ function terminateManagedProcess(id: string) {
 
 function stopAllConnectors() {
   for (const connector of connectorProcesses.values()) {
+    connector.stopRequested = true
+    clearConnectorRestart(connector.status.id)
     connector.process?.kill()
   }
   connectorProcesses.clear()
@@ -926,6 +1005,19 @@ async function chooseDesktopExecutable() {
   const options = {
     title: "Select executable",
     properties: ["openFile"] as Array<"openFile">,
+  }
+  const result = mainWindow
+    ? await dialog.showOpenDialog(mainWindow, options)
+    : await dialog.showOpenDialog(options)
+  return result.canceled ? "" : result.filePaths[0] || ""
+}
+
+async function chooseDesktopFolder(initialPath: unknown) {
+  const defaultPath = typeof initialPath === "string" && initialPath.trim() ? initialPath.trim() : undefined
+  const options = {
+    title: "Select workspace folder",
+    defaultPath,
+    properties: ["openDirectory", "createDirectory"] as Array<"openDirectory" | "createDirectory">,
   }
   const result = mainWindow
     ? await dialog.showOpenDialog(mainWindow, options)
