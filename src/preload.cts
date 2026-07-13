@@ -77,6 +77,8 @@ contextBridge.exposeInMainWorld("veloceDesktop", {
   runDesktopMenuAction: (action: "new-window" | "quit" | "close-window" | "copy" | "paste" | "cut" | "delete" | "undo" | "redo") => ipcRenderer.invoke("desktop:menu-action", action) as Promise<{ ok: boolean }>,
   openDesktopLink: (target: "official-site" | "github") => ipcRenderer.invoke("desktop:open-link", target) as Promise<{ ok: boolean }>,
   openExternalURL: (url: string) => ipcRenderer.invoke("desktop:open-external-url", url) as Promise<{ ok: boolean }>,
+  openDesktopBrowser: (url?: string) => ipcRenderer.invoke("browser:open", url) as Promise<{ ok: boolean }>,
+  browserAction: (input: Record<string, unknown>) => ipcRenderer.invoke("browser:action", input) as Promise<unknown>,
   checkDesktopUpdate: () => ipcRenderer.invoke("desktop-update:check") as Promise<DesktopUpdateResult>,
   installPreparedDesktopUpdate: () => ipcRenderer.invoke("desktop-update:install-prepared") as Promise<{ ok: boolean; message: string }>,
   getDesktopTabInitialState: () => ipcRenderer.invoke("desktop-tabs:get-initial-state") as Promise<{ windowID: number; tab: DesktopTab | null }>,
@@ -98,5 +100,15 @@ contextBridge.exposeInMainWorld("veloceDesktop", {
     const listener = (_event: Electron.IpcRendererEvent, tab: DesktopTab) => callback(tab)
     ipcRenderer.on("desktop-tabs:received", listener)
     return () => ipcRenderer.off("desktop-tabs:received", listener)
+  },
+  onBrowserState: (callback: (state: unknown) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, state: unknown) => callback(state)
+    ipcRenderer.on("browser:state", listener)
+    return () => ipcRenderer.off("browser:state", listener)
+  },
+  onBrowserAskPage: (callback: (page: { title?: string; url?: string }) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, page: { title?: string; url?: string }) => callback(page)
+    ipcRenderer.on("browser:ask-page", listener)
+    return () => ipcRenderer.off("browser:ask-page", listener)
   },
 })

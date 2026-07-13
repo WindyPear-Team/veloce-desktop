@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, Tray, dialog, ipcMain, shell } from "electron"
+import { app, BrowserWindow, Menu, Tray, WebContentsView, dialog, ipcMain, shell } from "electron"
 import { spawn, spawnSync } from "node:child_process"
 import type { ChildProcess } from "node:child_process"
 import fs from "node:fs"
@@ -16,11 +16,15 @@ const iconPath = path.join(__dirname, "..", "assets", "logo.png")
 const preloadPath = path.join(__dirname, "preload.cjs")
 
 let mainWindow: BrowserWindow | null = null
+let browserWindow: BrowserWindow | null = null
+let browserToolbarView: WebContentsView | null = null
 let tray: Tray | null = null
 let isQuitting = false
 let builtinServerEnabled = false
 let builtinServerProcess: ChildProcess | null = null
 const initialWindowTabs = new Map<number, DesktopTab>()
+const browserTabs = new Map<string, { id: string; title: string; url: string; view: WebContentsView }>()
+let activeBrowserTabID = ""
 
 type BuiltinServerPhase = "idle" | "checking" | "downloading" | "starting" | "running" | "error"
 type ManagedProcessKind = "builtin-server" | "connector"
@@ -128,6 +132,13 @@ interface ManagedConnectorProcess {
   stopRequested: boolean
 }
 
+interface BrowserToolbarState {
+  activeID: string
+  tabs: Array<{ id: string; title: string; url: string }>
+  canGoBack: boolean
+  canGoForward: boolean
+}
+
 let builtinServerStatus: BuiltinServerStatus = {
   enabled: false,
   running: false,
@@ -194,6 +205,207 @@ function showMainWindow() {
   }
   mainWindow.show()
   mainWindow.focus()
+}
+
+function normalizeBrowserURL(value: unknown) {
+  const raw = typeof value === "string" ? value.trim() : ""
+  if (!raw) {
+    return "https://www.bing.com/"
+  }
+  try {
+    const url = new URL(raw)
+    if (url.protocol === "http:" || url.protocol === "https:") {
+      return url.toString()
+    }
+  } catch {
+    // Treat text without a valid http(s) URL as a search query.
+  }
+  return `https://www.bing.com/search?q=${encodeURIComponent(raw)}`
+}
+
+function currentBrowserTab() {
+  return browserTabs.get(activeBrowserTabID) || null
+}
+
+function browserToolbarState(): BrowserToolbarState {
+  const active = currentBrowserTab()
+  return {
+    activeID: active?.id || "",
+    tabs: Array.from(browserTabs.values()).map((tab) => ({ id: tab.id, title: tab.title, url: tab.url })),
+    canGoBack: Boolean(active?.view.webContents.canGoBack()),
+    canGoForward: Boolean(active?.view.webContents.canGoForward()),
+  }
+}
+
+function emitBrowserState() {
+  browserToolbarView?.webContents.send("browser:state", browserToolbarState())
+}
+
+function askBrowserPage(tab: { title: string; url: string }) {
+  mainWindow?.webContents.send("browser:ask-page", { title: tab.title, url: tab.url })
+}
+
+function layoutBrowserViews() {
+  if (!browserWindow || browserWindow.isDestroyed() || !browserToolbarView) {
+    return
+  }
+  const [width, height] = browserWindow.getContentSize()
+  const toolbarHeight = 76
+  browserToolbarView.setBounds({ x: 0, y: 0, width, height: toolbarHeight })
+  const active = currentBrowserTab()
+  if (active) {
+    active.view.setBounds({ x: 0, y: toolbarHeight, width, height: Math.max(0, height - toolbarHeight) })
+  }
+}
+
+function setActiveBrowserTab(tabID: string) {
+  const tab = browserTabs.get(tabID)
+  if (!browserWindow || !tab) {
+    return
+  }
+  const current = currentBrowserTab()
+  if (current && current.id !== tabID) {
+    browserWindow.contentView.removeChildView(current.view)
+  }
+  activeBrowserTabID = tabID
+  browserWindow.contentView.addChildView(tab.view)
+  layoutBrowserViews()
+  emitBrowserState()
+}
+
+function createBrowserTab(rawURL?: string) {
+  if (!browserWindow) {
+    return
+  }
+  const id = `browser-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const view = new WebContentsView({
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  })
+  const tab = { id, title: "New tab", url: normalizeBrowserURL(rawURL), view }
+  browserTabs.set(id, tab)
+  view.webContents.on("page-title-updated", (_event, title) => {
+    tab.title = title.trim() || "New tab"
+    emitBrowserState()
+  })
+  const updateURL = () => {
+    tab.url = view.webContents.getURL() || tab.url
+    emitBrowserState()
+  }
+  view.webContents.on("did-navigate", updateURL)
+  view.webContents.on("did-navigate-in-page", updateURL)
+  view.webContents.on("did-stop-loading", updateURL)
+  view.webContents.setWindowOpenHandler(({ url }) => {
+    createBrowserTab(url)
+    return { action: "deny" }
+  })
+  view.webContents.on("context-menu", (_event, params) => {
+    const selection = params.selectionText.trim()
+    const menu = Menu.buildFromTemplate([
+      { label: "后退", enabled: view.webContents.canGoBack(), click: () => view.webContents.goBack() },
+      { label: "前进", enabled: view.webContents.canGoForward(), click: () => view.webContents.goForward() },
+      { label: "刷新", click: () => view.webContents.reload() },
+      { type: "separator" },
+      ...(selection ? [
+        { label: "复制", click: () => view.webContents.copy() },
+        { label: "使用 Bing 搜索选中文本", click: () => createBrowserTab(`https://www.bing.com/search?q=${encodeURIComponent(selection)}`) },
+      ] : []),
+      ...(selection ? [{ type: "separator" as const }] : []),
+      { label: "询问本页面", click: () => askBrowserPage(tab) },
+      { label: "在默认浏览器中打开", click: () => void shell.openExternal(tab.url) },
+    ])
+    if (browserWindow && !browserWindow.isDestroyed()) {
+      menu.popup({ window: browserWindow })
+    }
+  })
+  setActiveBrowserTab(id)
+  void view.webContents.loadURL(tab.url)
+}
+
+function closeBrowserTab(tabID: string) {
+  const tab = browserTabs.get(tabID)
+  if (!tab || !browserWindow) {
+    return
+  }
+  const ids = Array.from(browserTabs.keys())
+  const index = ids.indexOf(tabID)
+  browserWindow.contentView.removeChildView(tab.view)
+  browserTabs.delete(tabID)
+  tab.view.webContents.close()
+  if (browserTabs.size === 0) {
+    createBrowserTab()
+    return
+  }
+  if (activeBrowserTabID === tabID) {
+    setActiveBrowserTab(ids[Math.max(0, index - 1)] || Array.from(browserTabs.keys())[0])
+    return
+  }
+  emitBrowserState()
+}
+
+function openDesktopBrowser(rawURL?: string) {
+  if (!browserWindow || browserWindow.isDestroyed()) {
+    browserWindow = new BrowserWindow({
+      width: 1180,
+      height: 820,
+      minWidth: 760,
+      minHeight: 520,
+      title: "Veloce Browser",
+      icon: iconPath,
+      titleBarStyle: "hidden",
+      titleBarOverlay: {
+        color: "#ffffff00",
+        symbolColor: "#111827",
+        height: 36,
+      },
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        preload: preloadPath,
+        sandbox: false,
+      },
+    })
+    browserToolbarView = new WebContentsView({
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        preload: preloadPath,
+        sandbox: false,
+      },
+    })
+    browserWindow.contentView.addChildView(browserToolbarView)
+    browserWindow.on("resize", layoutBrowserViews)
+    browserWindow.on("closed", () => {
+      for (const tab of browserTabs.values()) {
+        tab.view.webContents.close()
+      }
+      browserWindow = null
+      browserToolbarView = null
+      activeBrowserTabID = ""
+      browserTabs.clear()
+    })
+    browserToolbarView.webContents.on("did-finish-load", emitBrowserState)
+    void browserToolbarView.webContents.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(browserToolbarHTML())}`)
+  }
+  browserWindow.show()
+  browserWindow.focus()
+  if (rawURL || browserTabs.size === 0) {
+    createBrowserTab(rawURL)
+  } else {
+    layoutBrowserViews()
+    emitBrowserState()
+  }
+}
+
+function browserToolbarHTML() {
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><style>
+*{box-sizing:border-box}body{position:relative;margin:0;background:#f7f8fa;color:#172033;font:13px system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden}.tabs{height:36px;display:flex;align-items:end;gap:4px;padding:4px 142px 0 8px;-webkit-app-region:drag}.tabs button,.nav button,.external{font:inherit;-webkit-app-region:no-drag}.tab{display:flex;align-items:center;gap:7px;min-width:0;max-width:220px;height:28px;padding:0 8px;border:1px solid transparent;border-radius:6px 6px 0 0;background:transparent;color:#667085}.tab.active{background:#fff;border-color:#e2e5ea;color:#172033}.tab span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tab-close{border:0;background:transparent;color:inherit;font-size:16px;line-height:1;cursor:pointer}.new-tab{width:28px;height:28px;border:0;border-radius:5px;background:transparent;color:#556070;font-size:18px;cursor:pointer}.external{position:absolute;right:138px;top:4px;display:flex;align-items:center;justify-content:center;width:28px;height:28px;border:0;border-radius:5px;background:transparent;cursor:pointer}.external:hover{background:#e9edf2}.browser-icon{position:relative;width:15px;height:12px;border:1.5px solid #556070;border-radius:2px}.browser-icon:before{content:'';position:absolute;left:-1.5px;right:-1.5px;top:2px;border-top:1.5px solid #556070}.nav{height:40px;display:flex;align-items:center;gap:6px;padding:4px 10px;border-top:1px solid #e5e7eb;background:#fff}.nav button{width:28px;height:28px;border:0;border-radius:5px;background:transparent;color:#475467;font-size:16px;cursor:pointer}.nav button:disabled{opacity:.35}.address{height:28px;flex:1;border:1px solid #d8dde5;border-radius:5px;background:#f7f8fa;padding:0 9px;color:#172033;outline:none}.address:focus{border-color:#98a2b3;background:#fff}</style></head>
+<body><div class="tabs" id="tabs"></div><button id="external" class="external" title="Open in default browser"><span class="browser-icon"></span></button><div class="nav"><button id="back" title="Back">&lt;</button><button id="forward" title="Forward">&gt;</button><button id="reload" title="Reload">R</button><input id="address" class="address" autocomplete="off" spellcheck="false"><button id="go" title="Go">Go</button></div>
+<script>const api=window.veloceDesktop;let state={tabs:[],activeID:'',canGoBack:false,canGoForward:false};const tabs=document.getElementById('tabs'),address=document.getElementById('address'),back=document.getElementById('back'),forward=document.getElementById('forward');const action=(input)=>api.browserAction(input);function render(next){state=next||state;tabs.textContent='';state.tabs.forEach(tab=>{const item=document.createElement('button');item.className='tab'+(tab.id===state.activeID?' active':'');item.onclick=()=>action({type:'activate',id:tab.id});const label=document.createElement('span');label.textContent=tab.title||tab.url;item.append(label);const close=document.createElement('button');close.className='tab-close';close.textContent='x';close.onclick=(event)=>{event.stopPropagation();action({type:'close',id:tab.id})};item.append(close);tabs.append(item)});const add=document.createElement('button');add.className='new-tab';add.textContent='+';add.onclick=()=>action({type:'new'});tabs.append(add);const active=state.tabs.find(tab=>tab.id===state.activeID);address.value=active?active.url:'';back.disabled=!state.canGoBack;forward.disabled=!state.canGoForward}address.addEventListener('keydown',event=>{if(event.key==='Enter')action({type:'navigate',url:address.value})});document.getElementById('go').onclick=()=>action({type:'navigate',url:address.value});document.getElementById('external').onclick=()=>action({type:'external'});back.onclick=()=>action({type:'back'});forward.onclick=()=>action({type:'forward'});document.getElementById('reload').onclick=()=>action({type:'reload'});api.onBrowserState(render);action({type:'state'}).then(render);</script></body></html>`
 }
 
 function veloceDataDir() {
@@ -566,6 +778,11 @@ function setupBuiltinServerIPC() {
       return { ok: false }
     }
   })
+  ipcMain.handle("browser:open", async (_event, rawURL?: unknown) => {
+    openDesktopBrowser(typeof rawURL === "string" ? rawURL : undefined)
+    return { ok: true }
+  })
+  ipcMain.handle("browser:action", async (_event, input: unknown) => handleBrowserAction(input))
   ipcMain.handle("desktop-update:check", async () => checkDesktopUpdate())
   ipcMain.handle("desktop-update:install-prepared", async () => installPreparedDesktopUpdate())
   ipcMain.handle("desktop-tabs:get-initial-state", (event) => {
@@ -756,6 +973,36 @@ async function bundledRuntimeInstall(binaryName: string, label: string) {
     assetName: executableName,
     executablePath,
   }
+}
+
+function handleBrowserAction(input: unknown) {
+  const value = input && typeof input === "object" ? input as Record<string, unknown> : {}
+  const type = typeof value.type === "string" ? value.type : ""
+  if (!browserWindow || browserWindow.isDestroyed()) {
+    openDesktopBrowser()
+  }
+  const tab = currentBrowserTab()
+  if (type === "new") {
+    createBrowserTab()
+  } else if (type === "activate" && typeof value.id === "string") {
+    setActiveBrowserTab(value.id)
+  } else if (type === "close" && typeof value.id === "string") {
+    closeBrowserTab(value.id)
+  } else if (type === "navigate" && tab) {
+    void tab.view.webContents.loadURL(normalizeBrowserURL(value.url))
+  } else if (type === "back" && tab?.view.webContents.canGoBack()) {
+    tab.view.webContents.goBack()
+  } else if (type === "forward" && tab?.view.webContents.canGoForward()) {
+    tab.view.webContents.goForward()
+  } else if (type === "reload" && tab) {
+    tab.view.webContents.reload()
+  } else if (type === "external" && tab) {
+    void shell.openExternal(tab.url)
+  } else if (type === "ask" && tab) {
+    askBrowserPage(tab)
+  }
+  emitBrowserState()
+  return browserToolbarState()
 }
 
 function clearConnectorRestart(connectorID: string) {
@@ -1260,7 +1507,7 @@ function createWindow(initialTab?: DesktopTab) {
   window.on("closed", () => {
     initialWindowTabs.delete(window.id)
     if (mainWindow === window) {
-      mainWindow = BrowserWindow.getAllWindows().find((candidate) => candidate !== window) || null
+      mainWindow = BrowserWindow.getAllWindows().find((candidate) => candidate !== window && candidate !== browserWindow) || null
     }
   })
 
