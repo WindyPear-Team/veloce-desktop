@@ -76,6 +76,7 @@ contextBridge.exposeInMainWorld("veloceDesktop", {
   openInVSCode: (workspacePath: string) => ipcRenderer.invoke("desktop:open-in-vscode", workspacePath) as Promise<{ ok: boolean; message: string }>,
   notifyTaskComplete: (input: { id: string; title: string; body: string }) => ipcRenderer.invoke("desktop:notify-task-complete", input) as Promise<{ ok: boolean; duplicate?: boolean }>,
   notifyConnectorApproval: (input: { id: string; taskID: string; title: string; body: string; approveLabel: string; rejectLabel: string }) => ipcRenderer.invoke("desktop:notify-connector-approval", input) as Promise<{ ok: boolean; duplicate?: boolean }>,
+  dismissConnectorApproval: (taskID: string) => ipcRenderer.invoke("desktop:dismiss-connector-approval", taskID) as Promise<{ ok: boolean }>,
   runDesktopMenuAction: (action: "new-window" | "quit" | "close-window" | "copy" | "paste" | "cut" | "delete" | "undo" | "redo") => ipcRenderer.invoke("desktop:menu-action", action) as Promise<{ ok: boolean }>,
   openDesktopLink: (target: "official-site" | "github") => ipcRenderer.invoke("desktop:open-link", target) as Promise<{ ok: boolean }>,
   openExternalURL: (url: string) => ipcRenderer.invoke("desktop:open-external-url", url) as Promise<{ ok: boolean }>,

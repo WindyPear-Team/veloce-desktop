@@ -24,6 +24,7 @@ const desktopProtocolScheme = "veloce"
 const desktopTaskNotificationIDs = new Set<string>()
 const desktopApprovalNotificationIDs = new Set<string>()
 const desktopApprovalNotificationOwners = new Map<string, Electron.WebContents>()
+const desktopApprovalNotifications = new Map<string, Notification>()
 let builtinServerEnabled = false
 let builtinServerProcess: ChildProcess | null = null
 const initialWindowTabs = new Map<number, DesktopTab>()
@@ -207,6 +208,7 @@ function handleDesktopProtocolURL(rawURL: string) {
       return
     }
     const owner = desktopApprovalNotificationOwners.get(taskID)
+    dismissDesktopApprovalNotification(taskID)
     if (owner && !owner.isDestroyed()) {
       owner.send("desktop:connector-approval-decision", { taskID, approved: decision === "approve" })
     }
@@ -774,6 +776,7 @@ function setupBuiltinServerIPC() {
   ipcMain.handle("desktop:open-in-vscode", async (_event, workspacePath: string) => openWorkspaceInVSCode(workspacePath))
   ipcMain.handle("desktop:notify-task-complete", (event, input: unknown) => showDesktopTaskNotification(event.sender, input))
   ipcMain.handle("desktop:notify-connector-approval", (event, input: unknown) => showDesktopApprovalNotification(event.sender, input))
+  ipcMain.handle("desktop:dismiss-connector-approval", (_event, taskID: unknown) => ({ ok: dismissDesktopApprovalNotification(typeof taskID === "string" ? taskID : "") }))
   ipcMain.handle("desktop:menu-action", (event, action: unknown) => {
     const window = BrowserWindow.fromWebContents(event.sender)
     if (action === "new-window") {
@@ -1074,6 +1077,7 @@ function showDesktopApprovalNotification(sender: Electron.WebContents, input: un
     const cleanup = setTimeout(() => {
       desktopApprovalNotificationIDs.delete(id)
       desktopApprovalNotificationOwners.delete(taskID)
+      desktopApprovalNotifications.delete(taskID)
     }, 10 * 60 * 1000)
     cleanup.unref()
     const options = {
@@ -1083,6 +1087,7 @@ function showDesktopApprovalNotification(sender: Electron.WebContents, input: un
       ...(process.platform === "win32" ? { toastXml: desktopApprovalToastXML(taskID, title, body, approveLabel, rejectLabel) } : {}),
     }
     const notification = new Notification(options)
+    desktopApprovalNotifications.set(taskID, notification)
     notification.on("click", () => {
       const owner = BrowserWindow.fromWebContents(sender)
       if (owner && !owner.isDestroyed()) {
@@ -1095,8 +1100,20 @@ function showDesktopApprovalNotification(sender: Electron.WebContents, input: un
   } catch {
     desktopApprovalNotificationIDs.delete(id)
     desktopApprovalNotificationOwners.delete(taskID)
+    desktopApprovalNotifications.delete(taskID)
     return { ok: false }
   }
+}
+
+function dismissDesktopApprovalNotification(taskID: string) {
+  const notification = desktopApprovalNotifications.get(taskID)
+  desktopApprovalNotifications.delete(taskID)
+  desktopApprovalNotificationOwners.delete(taskID)
+  if (!notification) {
+    return false
+  }
+  notification.close()
+  return true
 }
 
 function desktopApprovalToastXML(taskID: string, title: string, body: string, approveLabel: string, rejectLabel: string) {
