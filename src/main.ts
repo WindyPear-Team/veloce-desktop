@@ -4,6 +4,7 @@ import type { ChildProcess } from "node:child_process"
 import fs from "node:fs"
 import fsp from "node:fs/promises"
 import https from "node:https"
+import { randomUUID } from "node:crypto"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -58,6 +59,7 @@ interface DesktopSettings {
   builtinServerPath: string
   connectorPath: string
   preparedUpdate?: PreparedDesktopUpdate | null
+  desktopConnectorTokens: Record<string, string>
 }
 
 interface DesktopUpdateResult {
@@ -72,6 +74,10 @@ interface StartConnectorInput {
   token: string
   mode: "platform" | "web_server"
   webPort?: number
+  deviceID?: string
+  deviceKind?: "cli" | "desktop"
+  desktopInstanceID?: string
+  restart?: boolean
 }
 
 interface ConnectorStatus {
@@ -83,6 +89,8 @@ interface ConnectorStatus {
   version: string
   mode: "platform" | "web_server"
   startedAt: string
+  deviceID: string
+  deviceKind: "cli" | "desktop"
 }
 
 interface ManagedProcessStatus {
@@ -126,12 +134,14 @@ let builtinServerStatus: BuiltinServerStatus = {
 }
 
 const connectorProcesses = new Map<string, ManagedConnectorProcess>()
+const desktopConnectorEnsureRequests = new Map<string, Promise<{ ok: boolean; message: string; version: string }>>()
 
 let desktopSettings: DesktopSettings = {
   httpProxy: "",
   builtinServerPath: "",
   connectorPath: "",
   preparedUpdate: null,
+  desktopConnectorTokens: {},
 }
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
@@ -196,6 +206,25 @@ function desktopSettingsPath() {
   return path.join(veloceDataDir(), "desktop-settings.json")
 }
 
+function desktopInstanceIDPath() {
+  return path.join(veloceDataDir(), "desktop-instance-id")
+}
+
+function desktopInstanceID() {
+  try {
+    const existing = fs.readFileSync(desktopInstanceIDPath(), "utf8").trim()
+    if (/^[a-f0-9-]{36}$/i.test(existing)) {
+      return existing
+    }
+  } catch {
+    // A new installation receives an opaque random id below.
+  }
+  const instanceID = randomUUID()
+  fs.mkdirSync(veloceDataDir(), { recursive: true })
+  fs.writeFileSync(desktopInstanceIDPath(), instanceID, "utf8")
+  return instanceID
+}
+
 function builtinServerRuntimeDir() {
   return path.join(veloceDataDir(), "community-data")
 }
@@ -232,7 +261,10 @@ async function readDesktopSettings() {
 }
 
 async function writeDesktopSettings(settings: DesktopSettings) {
-  desktopSettings = normalizeDesktopSettings(settings)
+  desktopSettings = {
+    ...normalizeDesktopSettings(settings),
+    desktopConnectorTokens: desktopSettings.desktopConnectorTokens,
+  }
   applyDesktopProxySettings()
   await fsp.mkdir(veloceDataDir(), { recursive: true })
   await fsp.writeFile(desktopSettingsPath(), JSON.stringify(desktopSettings, null, 2))
@@ -244,6 +276,12 @@ function normalizeDesktopSettings(value: unknown): DesktopSettings {
   const prepared = item.preparedUpdate && typeof item.preparedUpdate === "object"
     ? item.preparedUpdate as Record<string, unknown>
     : null
+  const rawConnectorTokens = item.desktopConnectorTokens && typeof item.desktopConnectorTokens === "object"
+    ? item.desktopConnectorTokens as Record<string, unknown>
+    : {}
+  const desktopConnectorTokens = Object.fromEntries(Object.entries(rawConnectorTokens)
+    .filter(([, token]) => typeof token === "string" && token.trim())
+    .map(([serverURL, token]) => [serverURL, (token as string).trim()]))
   return {
     httpProxy: typeof item.httpProxy === "string" ? item.httpProxy.trim() : "",
     builtinServerPath: typeof item.builtinServerPath === "string" ? item.builtinServerPath.trim() : "",
@@ -251,7 +289,13 @@ function normalizeDesktopSettings(value: unknown): DesktopSettings {
     preparedUpdate: prepared && typeof prepared.tagName === "string" && typeof prepared.assetName === "string" && typeof prepared.filePath === "string"
       ? { tagName: prepared.tagName, assetName: prepared.assetName, filePath: prepared.filePath }
       : null,
+    desktopConnectorTokens,
   }
+}
+
+function desktopSettingsForRenderer() {
+  const { desktopConnectorTokens: _tokens, ...settings } = desktopSettings
+  return settings
 }
 
 function applyDesktopProxySettings() {
@@ -454,12 +498,13 @@ function setupBuiltinServerIPC() {
     return builtinServerStatus
   })
   ipcMain.handle("connector:start", async (_event, input: StartConnectorInput) => startConnector(input))
+  ipcMain.handle("connector:ensure-desktop", async (_event, input: { serverURL: string; authToken: string }) => ensureDesktopConnector(input))
   ipcMain.handle("desktop-processes:terminate", (_event, id: string) => terminateManagedProcess(id))
   ipcMain.handle("desktop-processes:get-status", () => getDesktopProcessStatus())
-  ipcMain.handle("desktop-settings:get", () => desktopSettings)
+  ipcMain.handle("desktop-settings:get", () => desktopSettingsForRenderer())
   ipcMain.handle("desktop-settings:save", async (_event, input: DesktopSettings) => writeDesktopSettings(input))
   ipcMain.handle("desktop-settings:choose-file", async () => chooseDesktopExecutable())
-  ipcMain.handle("desktop:get-system-info", () => ({ hostname: os.hostname(), platform: process.platform }))
+  ipcMain.handle("desktop:get-system-info", () => ({ hostname: os.hostname(), platform: process.platform, instanceID: desktopInstanceID() }))
   ipcMain.handle("desktop:open-in-vscode", async (_event, workspacePath: string) => openWorkspaceInVSCode(workspacePath))
   ipcMain.handle("desktop:menu-action", (event, action: unknown) => {
     const window = BrowserWindow.fromWebContents(event.sender)
@@ -698,6 +743,20 @@ async function startConnector(input: StartConnectorInput) {
   if (!serverURL || !token) {
     return { ok: false, message: "Missing connector server URL or token", version: "" }
   }
+  const deviceKind = input.deviceKind === "desktop" ? "desktop" : "cli"
+  const deviceID = input.deviceID?.trim() || ""
+  const existing = Array.from(connectorProcesses.values()).find((connector) =>
+    connector.status.deviceKind === deviceKind &&
+    connector.status.serverURL === serverURL &&
+    (deviceKind !== "desktop" || connector.status.deviceID === deviceID)
+  )
+  if (existing?.process && !existing.process.killed && !input.restart) {
+    return { ok: true, message: "Connector is already running", version: existing.status.version }
+  }
+  if (existing) {
+    existing.process?.kill()
+    connectorProcesses.delete(existing.status.id)
+  }
   const connectorID = `connector-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   connectorProcesses.set(connectorID, {
     process: null,
@@ -710,23 +769,34 @@ async function startConnector(input: StartConnectorInput) {
       version: "",
       mode: input.mode,
       startedAt: "",
+      deviceID,
+      deviceKind,
     },
   })
   emitDesktopProcessStatus()
   try {
-    updateConnectorStatus(connectorID, { phase: "checking", message: "Preparing bundled connector", serverURL, mode: input.mode })
-    const install = await ensureLatestConnectorInstall()
-    updateConnectorStatus(connectorID, { phase: "starting", message: "Starting connector", serverURL, version: install.tagName, mode: input.mode })
-    const args = ["-server", serverURL, "-token", token]
+    const useGoRunConnector = !app.isPackaged && !desktopSettings.connectorPath.trim()
+    updateConnectorStatus(connectorID, { phase: "checking", message: useGoRunConnector ? "Preparing connector from ../app" : "Preparing bundled connector", serverURL, mode: input.mode })
+    const install = useGoRunConnector ? null : await ensureLatestConnectorInstall()
+    const connectorVersion = useGoRunConnector ? "dev" : install!.tagName
+    updateConnectorStatus(connectorID, { phase: "starting", message: useGoRunConnector ? "Starting connector from ../app" : "Starting connector", serverURL, version: connectorVersion, mode: input.mode })
+    const args = ["-server", serverURL, "-token", token, "-device-kind", deviceKind]
+    if (deviceKind === "desktop") {
+      args.push("-desktop-instance-id", input.desktopInstanceID?.trim() || desktopInstanceID())
+    }
     if (input.mode === "web_server") {
       args.push("-mode", "web_server", "-web-port", String(input.webPort || 8080))
     }
-    const childProcess = spawn(install.executablePath, args, {
-      cwd: path.dirname(install.executablePath),
-      env: desktopProcessEnv(),
-      stdio: "ignore",
-      windowsHide: true,
-    })
+    const childProcess = spawn(
+      useGoRunConnector ? (process.platform === "win32" ? "go.exe" : "go") : install!.executablePath,
+      useGoRunConnector ? ["run", ".", ...args] : args,
+      {
+        cwd: useGoRunConnector ? path.resolve(__dirname, "..", "..", "app") : path.dirname(install!.executablePath),
+        env: desktopProcessEnv(),
+        stdio: "ignore",
+        windowsHide: true,
+      }
+    )
     const connector = connectorProcesses.get(connectorID)
     if (connector) {
       connector.process = childProcess
@@ -740,15 +810,81 @@ async function startConnector(input: StartConnectorInput) {
       phase: "running",
       message: "Connector is running",
       serverURL,
-      version: install.tagName,
+      version: connectorVersion,
       mode: input.mode,
       startedAt: new Date().toISOString(),
+      deviceID,
+      deviceKind,
     })
-    return { ok: true, message: "Connector started", version: install.tagName }
+    return { ok: true, message: "Connector started", version: connectorVersion }
   } catch (error) {
     connectorProcesses.delete(connectorID)
     emitDesktopProcessStatus()
     return { ok: false, message: error instanceof Error ? error.message : "Failed to start connector", version: "" }
+  }
+}
+
+function ensureDesktopConnector(input: { serverURL: string; authToken: string }) {
+  const key = input.serverURL.trim().replace(/\/+$/, "")
+  const pending = desktopConnectorEnsureRequests.get(key)
+  if (pending) {
+    return pending
+  }
+  const request = ensureDesktopConnectorForServer(input).finally(() => {
+    desktopConnectorEnsureRequests.delete(key)
+  })
+  desktopConnectorEnsureRequests.set(key, request)
+  return request
+}
+
+async function ensureDesktopConnectorForServer(input: { serverURL: string; authToken: string }) {
+  const serverURL = input.serverURL.trim().replace(/\/+$/, "")
+  const authToken = input.authToken.trim()
+  if (!/^https?:\/\//i.test(serverURL) || !authToken) {
+    return { ok: false, message: "Missing desktop connector server URL or login token", version: "" }
+  }
+  const savedToken = desktopSettings.desktopConnectorTokens[serverURL] || ""
+  try {
+    const response = await fetch(`${serverURL}/api/user/advanced-chat/devices/desktop/ensure`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${authToken}`,
+        "Content-Type": "application/json",
+        ...(savedToken ? { "X-Desktop-Connector-Token": savedToken } : {}),
+      },
+      body: JSON.stringify({
+        desktop_instance_id: desktopInstanceID(),
+        hostname: os.hostname(),
+        os: process.platform,
+        arch: process.arch,
+        version: app.getVersion(),
+      }),
+    })
+    const payload = await response.json().catch(() => ({})) as { token?: unknown; device?: { id?: unknown } }
+    if (!response.ok) {
+      throw new Error(typeof (payload as { error?: unknown }).error === "string" ? (payload as { error: string }).error : `HTTP ${response.status}`)
+    }
+    const token = typeof payload.token === "string" && payload.token.trim() ? payload.token.trim() : savedToken
+    const deviceID = typeof payload.device?.id === "string" ? payload.device.id.trim() : ""
+    if (!token || !deviceID) {
+      throw new Error("Desktop connector credentials are unavailable")
+    }
+    if (token !== savedToken) {
+      desktopSettings.desktopConnectorTokens[serverURL] = token
+      await fsp.mkdir(veloceDataDir(), { recursive: true })
+      await fsp.writeFile(desktopSettingsPath(), JSON.stringify(desktopSettings, null, 2))
+    }
+    return startConnector({
+      serverURL,
+      token,
+      mode: "platform",
+      deviceID,
+      deviceKind: "desktop",
+      desktopInstanceID: desktopInstanceID(),
+      restart: token !== savedToken,
+    })
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : "Failed to connect desktop connector", version: "" }
   }
 }
 

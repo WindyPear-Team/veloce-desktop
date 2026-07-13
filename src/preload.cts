@@ -71,7 +71,7 @@ contextBridge.exposeInMainWorld("veloceDesktop", {
   getDesktopSettings: () => ipcRenderer.invoke("desktop-settings:get") as Promise<DesktopSettings>,
   saveDesktopSettings: (settings: DesktopSettings) => ipcRenderer.invoke("desktop-settings:save", settings) as Promise<DesktopSettings>,
   chooseDesktopFile: () => ipcRenderer.invoke("desktop-settings:choose-file") as Promise<string>,
-  getDesktopSystemInfo: () => ipcRenderer.invoke("desktop:get-system-info") as Promise<{ hostname: string; platform: string }>,
+  getDesktopSystemInfo: () => ipcRenderer.invoke("desktop:get-system-info") as Promise<{ hostname: string; platform: string; instanceID: string }>,
   openInVSCode: (workspacePath: string) => ipcRenderer.invoke("desktop:open-in-vscode", workspacePath) as Promise<{ ok: boolean; message: string }>,
   runDesktopMenuAction: (action: "new-window" | "quit" | "close-window" | "copy" | "paste" | "cut" | "delete" | "undo" | "redo") => ipcRenderer.invoke("desktop:menu-action", action) as Promise<{ ok: boolean }>,
   openDesktopLink: (target: "official-site" | "github") => ipcRenderer.invoke("desktop:open-link", target) as Promise<{ ok: boolean }>,
@@ -81,6 +81,7 @@ contextBridge.exposeInMainWorld("veloceDesktop", {
   detachDesktopTab: (input: DesktopTab & { screenX: number; screenY: number }) => ipcRenderer.invoke("desktop-tabs:detach", input) as Promise<{ moved: boolean; targetWindowID?: number }>,
   setBuiltinServerEnabled: (enabled: boolean) => ipcRenderer.invoke("builtin-server:set-enabled", enabled) as Promise<BuiltinServerStatus>,
   startConnector: (input: StartConnectorInput) => ipcRenderer.invoke("connector:start", input) as Promise<StartConnectorResult>,
+  ensureDesktopConnector: (input: { serverURL: string; authToken: string }) => ipcRenderer.invoke("connector:ensure-desktop", input) as Promise<StartConnectorResult>,
   onBuiltinServerStatus: (callback: (status: BuiltinServerStatus) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, status: BuiltinServerStatus) => callback(status)
     ipcRenderer.on("builtin-server:status", listener)
