@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, Notification, Tray, WebContentsView, dialog, ipcMain, shell } from "electron"
+import { app, BrowserWindow, Menu, Notification, Tray, WebContentsView, dialog, ipcMain, nativeTheme, shell } from "electron"
 import { spawn, spawnSync } from "node:child_process"
 import type { ChildProcess } from "node:child_process"
 import fs from "node:fs"
@@ -30,6 +30,23 @@ let builtinServerProcess: ChildProcess | null = null
 const initialWindowTabs = new Map<number, DesktopTab>()
 const browserTabs = new Map<string, { id: string; title: string; url: string; view: WebContentsView }>()
 let activeBrowserTabID = ""
+let desktopTitleBarTheme: "light" | "dark" | null = null
+
+function titleBarOverlayOptions(theme = desktopTitleBarTheme || (nativeTheme.shouldUseDarkColors ? "dark" : "light")) {
+  return {
+    color: "#ffffff00",
+    symbolColor: theme === "dark" ? "#f8fafc" : "#111827",
+    height: 36,
+  }
+}
+
+function applyTitleBarOverlayTheme() {
+  for (const window of [mainWindow, browserWindow]) {
+    if (window && !window.isDestroyed()) {
+      window.setTitleBarOverlay(titleBarOverlayOptions())
+    }
+  }
+}
 
 type BuiltinServerPhase = "idle" | "checking" | "downloading" | "starting" | "running" | "error"
 type ManagedProcessKind = "builtin-server" | "connector"
@@ -406,11 +423,7 @@ function openDesktopBrowser(rawURL?: string) {
       icon: iconPath,
       ...(process.platform === "win32" ? { backgroundMaterial: "acrylic" as const } : {}),
       titleBarStyle: "hidden",
-      titleBarOverlay: {
-        color: "#ffffff00",
-        symbolColor: "#111827",
-        height: 36,
-      },
+      titleBarOverlay: titleBarOverlayOptions(),
       webPreferences: {
         contextIsolation: true,
         nodeIntegration: false,
@@ -830,6 +843,14 @@ function setupBuiltinServerIPC() {
     } catch {
       return { ok: false }
     }
+  })
+  ipcMain.handle("desktop:set-titlebar-theme", (_event, theme: unknown) => {
+    if (theme !== "light" && theme !== "dark") {
+      return { ok: false }
+    }
+    desktopTitleBarTheme = theme
+    applyTitleBarOverlayTheme()
+    return { ok: true }
   })
   ipcMain.handle("browser:open", async (_event, rawURL?: unknown) => {
     openDesktopBrowser(typeof rawURL === "string" ? rawURL : undefined)
@@ -1619,11 +1640,7 @@ function createWindow(initialTab?: DesktopTab) {
     icon: iconPath,
     ...(process.platform === "win32" ? { backgroundMaterial: "acrylic" as const } : {}),
     titleBarStyle: "hidden",
-    titleBarOverlay: {
-      color: "#ffffff00",
-      symbolColor: "#111827",
-      height: 36,
-    },
+    titleBarOverlay: titleBarOverlayOptions(),
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,

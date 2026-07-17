@@ -80,6 +80,7 @@ contextBridge.exposeInMainWorld("veloceDesktop", {
   runDesktopMenuAction: (action: "new-window" | "quit" | "close-window" | "copy" | "paste" | "cut" | "delete" | "undo" | "redo") => ipcRenderer.invoke("desktop:menu-action", action) as Promise<{ ok: boolean }>,
   openDesktopLink: (target: "official-site" | "github") => ipcRenderer.invoke("desktop:open-link", target) as Promise<{ ok: boolean }>,
   openExternalURL: (url: string) => ipcRenderer.invoke("desktop:open-external-url", url) as Promise<{ ok: boolean }>,
+  setTitleBarTheme: (theme: "light" | "dark") => ipcRenderer.invoke("desktop:set-titlebar-theme", theme) as Promise<{ ok: boolean }>,
   openDesktopBrowser: (url?: string) => ipcRenderer.invoke("browser:open", url) as Promise<{ ok: boolean }>,
   browserAction: (input: Record<string, unknown>) => ipcRenderer.invoke("browser:action", input) as Promise<unknown>,
   checkDesktopUpdate: () => ipcRenderer.invoke("desktop-update:check") as Promise<DesktopUpdateResult>,
